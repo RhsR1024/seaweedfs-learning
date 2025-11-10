@@ -469,20 +469,67 @@ func (s *Store) Close() {
 	}
 }
 
+// WriteVolumeNeedle Store 层的写入 Needle 方法
+// 这是从 topology.ReplicatedWrite 调用的入口点
+//
+// 参数:
+//   - i: Volume ID
+//   - n: 要写入的 Needle 对象
+//   - checkCookie: 是否验证 Cookie（防止错误覆盖）
+//   - fsync: 是否需要 fsync 刷盘
+//
+// 返回值:
+//   - isUnchanged: 文件是否未改变（幂等写入）
+//   - err: 错误信息
+//
+// 工作流程:
+//  1. 查找指定的 Volume
+//  2. 检查 Volume 是否只读
+//  3. 调用 Volume.writeNeedle2 执行实际写入
+//  4. 如果 Store 正在停止，禁用 fsync（避免阻塞关闭）
+//
+// 注意:
+//   - 如果 Volume 不存在，返回错误
+//   - 如果 Volume 只读，返回错误
+//   - fsync && !s.isStopping: 确保关闭时不会因为 fsync 而长时间阻塞
 func (s *Store) WriteVolumeNeedle(i needle.VolumeId, n *needle.Needle, checkCookie bool, fsync bool) (isUnchanged bool, err error) {
+	// 步骤 1: 查找 Volume
 	if v := s.findVolume(i); v != nil {
+		// 步骤 2: 检查 Volume 是否只读
 		if v.IsReadOnly() {
 			err = fmt.Errorf("volume %d is read only", i)
 			return
 		}
+		// 步骤 3: 调用 Volume 的写入方法
+		// fsync && !s.isStopping: 如果 Store 正在停止，禁用 fsync 避免阻塞
 		_, _, isUnchanged, err = v.writeNeedle2(n, checkCookie, fsync && !s.isStopping)
 		return
 	}
+	// Volume 不存在
 	glog.V(0).Infoln("volume", i, "not found!")
 	err = fmt.Errorf("volume %d not found on %s:%d", i, s.Ip, s.Port)
 	return
 }
 
+// DeleteVolumeNeedle Store 层的删除 Needle 方法
+// 从指定 Volume 中删除 Needle
+//
+// 参数:
+//   - i: Volume ID
+//   - n: 要删除的 Needle 对象（包含 needleId）
+//
+// 返回值:
+//   - Size: 删除的数据大小
+//   - error: 错误信息
+//
+// 工作流程:
+//  1. 查找指定的 Volume
+//  2. 检查 Volume 是否允许删除（noWriteOrDelete）
+//  3. 调用 Volume.deleteNeedle2 执行实际删除
+//
+// 注意:
+//   - 删除是逻辑删除，数据仍在磁盘上，通过 Compaction 回收空间
+//   - 如果 Volume 不存在，返回错误
 func (s *Store) DeleteVolumeNeedle(i needle.VolumeId, n *needle.Needle) (Size, error) {
 	if v := s.findVolume(i); v != nil {
 		if v.noWriteOrDelete {
@@ -493,6 +540,18 @@ func (s *Store) DeleteVolumeNeedle(i needle.VolumeId, n *needle.Needle) (Size, e
 	return 0, fmt.Errorf("volume %d not found on %s:%d", i, s.Ip, s.Port)
 }
 
+// ReadVolumeNeedle Store 层的读取 Needle 方法
+// 从指定 Volume 中读取 Needle 数据
+//
+// 参数:
+//   - i: Volume ID
+//   - n: Needle 对象（输入 needleId，输出完整数据）
+//   - readOption: 读取选项（可选，如是否读取数据）
+//   - onReadSizeFn: 读取大小回调函数（可选，用于统计）
+//
+// 返回值:
+//   - int: 读取的字节数
+//   - error: 错误信息
 func (s *Store) ReadVolumeNeedle(i needle.VolumeId, n *needle.Needle, readOption *ReadOption, onReadSizeFn func(size Size)) (int, error) {
 	if v := s.findVolume(i); v != nil {
 		return v.readNeedle(n, readOption, onReadSizeFn)

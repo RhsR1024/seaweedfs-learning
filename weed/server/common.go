@@ -139,21 +139,24 @@ func debug(params ...interface{}) {
 // 4. 返回文件的 fid 和 URL
 //
 // 参数：
-//   w: HTTP 响应
-//   r: HTTP 请求（包含上传的文件）
-//   masterFn: 获取 Master Server 地址的函数
-//   grpcDialOption: gRPC 连接选项
+//
+//	w: HTTP 响应
+//	r: HTTP 请求（包含上传的文件）
+//	masterFn: 获取 Master Server 地址的函数
+//	grpcDialOption: gRPC 连接选项
 //
 // 请求示例：
-//   curl -F file=@/etc/hosts "http://127.0.0.1:9333/submit"
+//
+//	curl -F file=@/etc/hosts "http://127.0.0.1:9333/submit"
 //
 // 响应示例：
-//   {
-//     "fileName": "hosts",
-//     "fid": "3,01e3b0756f",
-//     "fileUrl": "http://localhost:8080/3,01e3b0756f",
-//     "size": 1024
-//   }
+//
+//	{
+//	  "fileName": "hosts",
+//	  "fid": "3,01e3b0756f",
+//	  "fileUrl": "http://localhost:8080/3,01e3b0756f",
+//	  "size": 1024
+//	}
 func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption) {
 	ctx := r.Context()
 	m := make(map[string]interface{})
@@ -166,6 +169,10 @@ func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn ope
 
 	debug("parsing upload file...")
 	// 从对象池中获取缓冲区（避免频繁分配内存）
+	// 避免频繁的内存分配和回收
+	// 减少垃圾回收压力
+	// 提高性能，特别是在高并发场景下
+	// 缓冲区可能已经有一定容量，减少重新分配的次数
 	bytesBuffer := bufPool.Get().(*bytes.Buffer)
 	defer bufPool.Put(bytesBuffer)
 
@@ -224,12 +231,12 @@ func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn ope
 
 	// 构建上传选项
 	uploadOption := &operation.UploadOption{
-		UploadUrl:         url,             // Volume Server 的 URL
-		Filename:          pu.FileName,     // 文件名
-		Cipher:            false,           // 是否加密
-		IsInputCompressed: pu.IsGzipped,    // 是否已压缩
-		MimeType:          pu.MimeType,     // MIME 类型
-		PairMap:           pu.PairMap,      // 自定义键值对
+		UploadUrl:         url,               // Volume Server 的 URL
+		Filename:          pu.FileName,       // 文件名
+		Cipher:            false,             // 是否加密
+		IsInputCompressed: pu.IsGzipped,      // 是否已压缩
+		MimeType:          pu.MimeType,       // MIME 类型
+		PairMap:           pu.PairMap,        // 自定义键值对
 		Jwt:               assignResult.Auth, // JWT 认证令牌
 	}
 
@@ -250,10 +257,10 @@ func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn ope
 
 	// 构建响应 JSON
 	m["fileName"] = pu.FileName
-	m["fid"] = assignResult.Fid // 文件 ID，用于后续访问
+	m["fid"] = assignResult.Fid                                    // 文件 ID，用于后续访问
 	m["fileUrl"] = assignResult.PublicUrl + "/" + assignResult.Fid // 公开访问 URL
-	m["size"] = pu.OriginalDataSize // 文件大小
-	m["eTag"] = uploadResult.ETag   // ETag（用于缓存验证）
+	m["size"] = pu.OriginalDataSize                                // 文件大小
+	m["eTag"] = uploadResult.ETag                                  // ETag（用于缓存验证）
 
 	// 返回 201 Created 状态码和结果
 	writeJsonQuiet(w, r, http.StatusCreated, m)
@@ -265,19 +272,22 @@ func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn ope
 // 例如：3,01e3b0756f 或 3,01e3b0756f.jpg
 //
 // 支持的 URL 格式：
-//   /<vid>/<fid>/<filename>       - 如：/3/01e3b0756f/photo.jpg
-//   /<vid>/<fid>                  - 如：/3/01e3b0756f  或 /3/01e3b0756f.jpg
-//   /<vid>,<fid>                  - 如：/3,01e3b0756f 或 /3,01e3b0756f.jpg
+//
+//	/<vid>/<fid>/<filename>       - 如：/3/01e3b0756f/photo.jpg
+//	/<vid>/<fid>                  - 如：/3/01e3b0756f  或 /3/01e3b0756f.jpg
+//	/<vid>,<fid>                  - 如：/3,01e3b0756f 或 /3,01e3b0756f.jpg
 //
 // 参数：
-//   path: URL 路径（如 "/3,01e3b0756f.jpg"）
+//
+//	path: URL 路径（如 "/3,01e3b0756f.jpg"）
 //
 // 返回值：
-//   vid: 卷 ID（如 "3"）
-//   fid: 文件 ID（如 "01e3b0756f"）
-//   filename: 文件名（可选）
-//   ext: 扩展名（如 ".jpg"）
-//   isVolumeIdOnly: 是否只有卷 ID（用于查询卷信息）
+//
+//	vid: 卷 ID（如 "3"）
+//	fid: 文件 ID（如 "01e3b0756f"）
+//	filename: 文件名（可选）
+//	ext: 扩展名（如 ".jpg"）
+//	isVolumeIdOnly: 是否只有卷 ID（用于查询卷信息）
 func parseURLPath(path string) (vid, fid, filename, ext string, isVolumeIdOnly bool) {
 	switch strings.Count(path, "/") {
 	case 3:

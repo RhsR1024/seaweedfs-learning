@@ -34,7 +34,7 @@ Master Server (localhost:9333)
     │
     ▼
 submitForClientHandler()  # 上传核心处理
-    │   └─ weed/server/common.go:132
+    │   └─ weed/server/common.go:157
     │
     ├─ 1️⃣ 解析上传文件
     │   └─ needle.ParseUpload(r, 256MB, buffer)

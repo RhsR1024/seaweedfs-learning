@@ -8,11 +8,12 @@
 //  4. GetWritableRemoteReplications: 获取可写的远程副本位置
 //
 // 副本策略:
-//   SeaweedFS 支持多种副本策略（如 000, 001, 010, 100, 110 等）
-//   - 第一位: 同数据中心的副本数
-//   - 第二位: 不同机架的副本数
-//   - 第三位: 不同数据中心的副本数
-//   例如: "001" 表示 1 个主副本 + 1 个不同数据中心的副本 = 总共 2 个副本
+//
+//	SeaweedFS 支持多种副本策略（如 000, 001, 010, 100, 110 等）
+//	- 第一位: 同数据中心的副本数
+//	- 第二位: 不同机架的副本数
+//	- 第三位: 不同数据中心的副本数
+//	例如: "001" 表示 1 个主副本 + 1 个不同数据中心的副本 = 总共 2 个副本
 package topology
 
 import (
@@ -142,7 +143,7 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 			}
 			// 设置查询参数
 			q := url.Values{
-				"type": {"replicate"}, // 标记为副本复制请求，避免二次复制
+				"type": {"replicate"},    // 标记为副本复制请求，避免二次复制
 				"ttl":  {n.Ttl.String()}, // Time To Live
 			}
 			if n.LastModified > 0 {
@@ -179,7 +180,7 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 			uploadOption := &operation.UploadOption{
 				UploadUrl:         u.String(),
 				Filename:          string(n.Name),
-				Cipher:            false,           // Volume Server 不加密
+				Cipher:            false,            // Volume Server 不加密
 				IsInputCompressed: n.IsCompressed(), // 传递压缩状态
 				MimeType:          string(n.Mime),
 				PairMap:           pairMap,
@@ -374,11 +375,10 @@ func DistributedOperation(locations []operation.Location, op func(location opera
 //   - 如果本地没有该 Volume，也会查询远程位置（用于纯副本场景）
 //   - 如果副本数不足，会记录错误但仍返回现有副本列表
 func GetWritableRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOption, volumeId needle.VolumeId, masterFn operation.GetMasterFn) (remoteLocations []operation.Location, err error) {
-
 	// 获取本地 Volume
 	v := s.GetVolume(volumeId)
 	if v != nil && v.ReplicaPlacement.GetCopyCount() == 1 {
-		// 副本数为 1（没有副本），无需复制
+		// 副本数为 1（没有副本），无需复制/删除
 		return
 	}
 

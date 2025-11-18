@@ -274,6 +274,33 @@ func readChunkNeedle(fileUrl string, w io.Writer, offset int64, jwt string) (wri
 	return io.Copy(w, resp.Body)
 }
 
+// NewChunkedFileReader 创建分块文件读取器
+// 初始化一个可从任意位置读取分块大文件的读取器
+//
+// 参数:
+//   - chunkList: 分块信息列表（包含每个分块的 fid、偏移量和大小）
+//   - master: Master Server 地址（用于查询分块所在的 Volume Server）
+//   - grpcDialOption: gRPC 连接选项
+//
+// 返回值:
+//   - *ChunkedFileReader: 初始化完成的读取器
+//
+// 工作流程:
+//  1. 计算所有分块的总大小
+//  2. 按偏移量对分块排序（确保读取顺序正确）
+//  3. 初始化读取器状态（位置从 0 开始）
+//
+// 使用示例:
+//
+//	reader := NewChunkedFileReader(manifest.Chunks, masterAddr, grpcOpt)
+//	defer reader.Close()
+//	data := make([]byte, 1024)
+//	n, err := reader.Read(data)
+//
+// 特性:
+//   - 延迟加载：分块数据在实际读取时才从 Volume Server 获取
+//   - 支持 Seek：可以跳转到任意位置
+//   - 自动跨块：透明处理跨分块的读取请求
 func NewChunkedFileReader(chunkList []*ChunkInfo, master pb.ServerAddress, grpcDialOption grpc.DialOption) *ChunkedFileReader {
 	var totalSize int64
 	for _, chunk := range chunkList {
@@ -288,6 +315,35 @@ func NewChunkedFileReader(chunkList []*ChunkInfo, master pb.ServerAddress, grpcD
 	}
 }
 
+// Seek 设置下次读取的位置（实现 io.Seeker 接口）
+// 支持从文件开头、当前位置或末尾计算新位置
+//
+// 参数:
+//   - offset: 偏移量（字节数）
+//   - whence: 基准位置
+//   - io.SeekStart (0): 从文件开头计算
+//   - io.SeekCurrent (1): 从当前位置计算
+//   - io.SeekEnd (2): 从文件末尾计算（offset 通常为负数）
+//
+// 返回值:
+//   - int64: 新的绝对位置
+//   - error: 如果新位置超出文件末尾，返回 ErrInvalidRange
+//
+// 使用示例:
+//
+//	// 跳到文件开头
+//	reader.Seek(0, io.SeekStart)
+//
+//	// 向前跳 1MB
+//	reader.Seek(1024*1024, io.SeekCurrent)
+//
+//	// 跳到文件末尾前 100 字节
+//	reader.Seek(-100, io.SeekEnd)
+//
+// 注意:
+//   - 如果位置发生变化，会关闭当前的读取管道
+//   - 新位置的数据会在下次 Read 时延迟加载
+//   - 即使返回错误，位置也会被更新
 func (cf *ChunkedFileReader) Seek(offset int64, whence int) (int64, error) {
 	var err error
 	switch whence {
@@ -307,6 +363,36 @@ func (cf *ChunkedFileReader) Seek(offset int64, whence int) (int64, error) {
 	return cf.pos, err
 }
 
+// WriteTo 将分块文件数据写入到指定的 Writer（实现 io.WriterTo 接口）
+// 从当前位置开始，将所有剩余数据写入目标
+//
+// 参数:
+//   - w: 数据输出目标（如 HTTP ResponseWriter、文件等）
+//
+// 返回值:
+//   - n: 实际写入的字节数
+//   - err: 读取或写入错误
+//
+// 工作流程:
+//  1. 根据当前位置找到对应的分块
+//  2. 计算分块内的起始偏移
+//  3. 依次读取并写入每个分块的数据
+//  4. 更新读取位置
+//
+// 关键特性:
+//   - 自动处理跨分块读取
+//   - 支持从分块中间开始读取（用于 Seek 后的读取）
+//   - 每次读取分块时通过 Master 查询 Volume Server 地址
+//   - 使用 Range 请求实现部分读取
+//
+// 错误处理:
+//   - 如果当前位置无效，返回 ErrInvalidRange
+//   - 如果查询分块位置失败，返回 lookup 错误
+//   - 如果读取分块数据失败，返回读取错误
+//
+// 性能考虑:
+//   - 每个分块的 URL 是动态查询的（支持分块迁移）
+//   - 数据直接流式传输，不在内存中缓存整个文件
 func (cf *ChunkedFileReader) WriteTo(w io.Writer) (n int64, err error) {
 	chunkIndex := -1
 	chunkStartOffset := int64(0)
@@ -341,21 +427,103 @@ func (cf *ChunkedFileReader) WriteTo(w io.Writer) (n int64, err error) {
 	return n, nil
 }
 
+// ReadAt 从指定位置读取数据（实现 io.ReaderAt 接口）
+// 支持随机访问，不影响其他并发读取操作
+//
+// 参数:
+//   - p: 数据缓冲区
+//   - off: 读取的起始位置（绝对偏移量）
+//
+// 返回值:
+//   - n: 实际读取的字节数
+//   - err: 读取错误
+//
+// 使用示例:
+//
+//	data := make([]byte, 1024)
+//	n, err := reader.ReadAt(data, 8192) // 从 8KB 位置读取 1KB 数据
+//
+// 注意:
+//   - 会先 Seek 到指定位置，然后读取
+//   - 会修改内部的读取位置状态
+//   - 适用于需要随机访问文件内容的场景
 func (cf *ChunkedFileReader) ReadAt(p []byte, off int64) (n int, err error) {
 	cf.Seek(off, 0)
 	return cf.Read(p)
 }
 
+// Read 读取数据到缓冲区（实现 io.Reader 接口）
+// 从当前位置读取数据，支持流式读取
+//
+// 参数:
+//   - p: 数据缓冲区
+//
+// 返回值:
+//   - int: 实际读取的字节数
+//   - error: 读取错误（包括 io.EOF）
+//
+// 工作流程:
+//  1. 获取或创建管道读取器
+//  2. 从管道读取数据
+//  3. 内部协程会从 Volume Server 获取分块数据并写入管道
+//
+// 使用示例:
+//
+//	data := make([]byte, 4096)
+//	for {
+//	    n, err := reader.Read(data)
+//	    if err == io.EOF {
+//	        break
+//	    }
+//	    // 处理 data[:n]
+//	}
+//
+// 特性:
+//   - 延迟加载：数据在首次 Read 时才开始从服务器获取
+//   - 自动缓冲：使用管道实现生产者-消费者模式
+//   - 流式处理：支持大文件的流式读取，无需全部加载到内存
 func (cf *ChunkedFileReader) Read(p []byte) (int, error) {
 	return cf.getPipeReader().Read(p)
 }
 
+// Close 关闭分块文件读取器（实现 io.Closer 接口）
+// 释放相关资源，包括关闭管道连接
+//
+// 返回值:
+//   - error: 关闭时的错误（如果有）
+//
+// 注意:
+//   - 线程安全：使用互斥锁保护
+//   - 幂等操作：多次调用不会产生错误
+//   - 使用 defer 确保资源释放
+//
+// 使用示例:
+//
+//	reader := NewChunkedFileReader(chunks, master, opt)
+//	defer reader.Close()
+//	// 使用 reader...
 func (cf *ChunkedFileReader) Close() (e error) {
 	cf.mutex.Lock()
 	defer cf.mutex.Unlock()
 	return cf.closePipe()
 }
 
+// closePipe 关闭内部管道
+// 释放管道读写器资源
+//
+// 返回值:
+//   - error: 关闭时的最后一个错误（如果有）
+//
+// 工作流程:
+//  1. 关闭管道读取端（如果存在）
+//  2. 置空读取端指针
+//  3. 关闭管道写入端（如果存在）
+//  4. 置空写入端指针
+//
+// 注意:
+//   - 此方法不加锁，调用者需要确保线程安全
+//   - 关闭管道会导致正在进行的 WriteTo 操作失败
+//   - 返回的是最后一个错误，可能丢失第一个错误
 func (cf *ChunkedFileReader) closePipe() (e error) {
 	if cf.pr != nil {
 		if err := cf.pr.Close(); err != nil {
@@ -372,6 +540,31 @@ func (cf *ChunkedFileReader) closePipe() (e error) {
 	return e
 }
 
+// getPipeReader 获取或创建管道读取器
+// 使用管道实现生产者-消费者模式的流式读取
+//
+// 返回值:
+//   - io.Reader: 管道读取端
+//
+// 工作流程:
+//  1. 加锁保护并发访问
+//  2. 如果管道已存在且有效，直接返回
+//  3. 否则关闭旧管道，创建新管道
+//  4. 启动协程从 Volume Server 获取数据并写入管道
+//  5. 返回管道读取端
+//
+// 生产者-消费者模式:
+//   - 生产者（协程）：调用 WriteTo 从服务器获取数据
+//   - 消费者（调用者）：通过返回的 Reader 读取数据
+//   - 管道作为缓冲区，实现异步数据传输
+//
+// 线程安全:
+//   - 使用互斥锁保护管道的创建和访问
+//   - 生产者协程独立运行，通过管道传输数据
+//
+// 错误处理:
+//   - 生产者协程的错误通过 CloseWithError 传递给消费者
+//   - 消费者在 Read 时会收到这些错误
 func (cf *ChunkedFileReader) getPipeReader() io.Reader {
 	cf.mutex.Lock()
 	defer cf.mutex.Unlock()

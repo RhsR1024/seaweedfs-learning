@@ -30,11 +30,11 @@ const (
 // "Needle"（针）这个名字形象地比喻了在大型卷文件中精确定位小文件的能力。
 //
 // 设计理念：
-//   1. 将多个小文件打包到一个大文件（卷）中，减少文件系统元数据开销
-//   2. 使用内存索引快速定位文件在卷中的位置
-//   3. 支持文件元数据（文件名、MIME 类型、自定义属性）
-//   4. 内置数据完整性校验（CRC32）
-//   5. 支持 TTL（生存时间）自动过期
+//  1. 将多个小文件打包到一个大文件（卷）中，减少文件系统元数据开销
+//  2. 使用内存索引快速定位文件在卷中的位置
+//  3. 支持文件元数据（文件名、MIME 类型、自定义属性）
+//  4. 内置数据完整性校验（CRC32）
+//  5. 支持 TTL（生存时间）自动过期
 //
 // 存储格式版本：
 //   - Version 1: 基础版本，只包含 Cookie, Id, Size, Data
@@ -48,9 +48,10 @@ const (
 //   - 自定义键值对最大 64KB
 //
 // 磁盘存储布局：
-//   [Cookie][Id][Size][DataSize][Data][Flags][NameSize][Name]
-//   [MimeSize][Mime][PairsSize][Pairs][LastModified][Ttl]
-//   [Checksum][AppendAtNs][Padding]
+//
+//	[Cookie][Id][Size][DataSize][Data][Flags][NameSize][Name]
+//	[MimeSize][Mime][PairsSize][Pairs][LastModified][Ttl]
+//	[Checksum][AppendAtNs][Padding]
 type Needle struct {
 	// Cookie 随机数，用于防止暴力破解查找
 	// 即使知道 NeedleId，也需要正确的 Cookie 才能访问文件
@@ -158,7 +159,8 @@ type Needle struct {
 //   - 是否压缩
 //
 // 示例输出：
-//   "3,01637037d6 Size:1024, DataSize:950, Name:photo.jpg, Mime:image/jpeg Compressed:true"
+//
+//	"3,01637037d6 Size:1024, DataSize:950, Name:photo.jpg, Mime:image/jpeg Compressed:true"
 func (n *Needle) String() (str string) {
 	str = fmt.Sprintf("%s Size:%d, DataSize:%d, Name:%s, Mime:%s Compressed:%v",
 		formatNeedleIdCookie(n.Id, n.Cookie), n.Size, n.DataSize, n.Name, n.Mime, n.IsCompressed())
@@ -168,34 +170,38 @@ func (n *Needle) String() (str string) {
 // CreateNeedleFromRequest 从 HTTP 请求创建一个 Needle 对象
 //
 // 这是处理文件上传的核心函数，负责：
-//   1. 解析 multipart/form-data 上传
-//   2. 提取文件数据和元数据
-//   3. 处理文件压缩
-//   4. 修复 JPEG 图片方向（可选）
-//   5. 计算 CRC32 校验和
-//   6. 解析文件 ID（fid）
+//  1. 解析 multipart/form-data 上传
+//  2. 提取文件数据和元数据
+//  3. 处理文件压缩
+//  4. 修复 JPEG 图片方向（可选）
+//  5. 计算 CRC32 校验和
+//  6. 解析文件 ID（fid）
 //
 // 参数：
-//   r: HTTP 请求对象，包含上传的文件和元数据
-//   fixJpgOrientation: 是否自动修复 JPEG 图片的 EXIF 方向
-//     某些相机拍摄的照片方向信息存储在 EXIF 中，而不是真实旋转图片
-//   sizeLimit: 文件大小限制（字节），超过此限制将被拒绝
-//   bytesBuffer: 用于读取数据的缓冲区，可复用以减少内存分配
+//
+//	r: HTTP 请求对象，包含上传的文件和元数据
+//	fixJpgOrientation: 是否自动修复 JPEG 图片的 EXIF 方向
+//	  某些相机拍摄的照片方向信息存储在 EXIF 中，而不是真实旋转图片
+//	sizeLimit: 文件大小限制（字节），超过此限制将被拒绝
+//	bytesBuffer: 用于读取数据的缓冲区，可复用以减少内存分配
 //
 // 返回：
-//   n: 创建的 Needle 对象
-//   originalSize: 原始文件大小（压缩前）
-//   contentMd5: 文件内容的 MD5 哈希（如果客户端提供）
-//   e: 错误信息
+//
+//	n: 创建的 Needle 对象
+//	originalSize: 原始文件大小（压缩前）
+//	contentMd5: 文件内容的 MD5 哈希（如果客户端提供）
+//	e: 错误信息
 //
 // URL 格式：
-//   POST /volumeId,needleId[.ext]
-//   例如：POST /3,01637037d6.jpg
+//
+//	POST /volumeId,needleId[.ext]
+//	例如：POST /3,01637037d6.jpg
 //
 // 自定义元数据：
-//   通过 HTTP 头传递，格式为 "Seaweed-Key: Value"
-//   例如：Seaweed-Author: John
-//   存储时去掉 "Seaweed-" 前缀
+//
+//	通过 HTTP 头传递，格式为 "Seaweed-Key: Value"
+//	例如：Seaweed-Author: John
+//	存储时去掉 "Seaweed-" 前缀
 func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit int64, bytesBuffer *bytes.Buffer) (n *Needle, originalSize int, contentMd5 string, e error) {
 	n = new(Needle)
 
@@ -278,7 +284,7 @@ func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit 
 
 	// 从 URL 路径中提取文件 ID (fid)
 	// 格式：/volumeId,needleId[.ext]
-	// 例如：/3,01637037d6.jpg
+	// 例如，对于 URL /3,01637037d6.jpg，会提取出 01637037d6 作为 fid
 	commaSep := strings.LastIndex(r.URL.Path, ",")
 	dotSep := strings.LastIndex(r.URL.Path, ".")
 	fid := r.URL.Path[commaSep+1:]
@@ -289,31 +295,37 @@ func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit 
 
 	// 解析 fid，提取 NeedleId 和 Cookie
 	e = n.ParsePath(fid)
-
 	return
 }
+
 // ParsePath 解析文件 ID (fid) 字符串，提取 NeedleId 和 Cookie
 //
 // fid 格式：
-//   基础格式：needleId_cookie
-//   带 delta：needleId_cookie_delta
+//
+//	基础格式：needleId_cookie
+//	带 delta：needleId_cookie_delta
 //
 // 示例：
-//   "01637037d6" -> needleId=01637037d6, cookie=<从末尾提取>
-//   "01637037d6_100" -> needleId=01637037d6+100, cookie=<从末尾提取>
+//
+//	"01637037d6" -> needleId=01637037d6, cookie=<从末尾提取>
+//	"01637037d6_100" -> needleId=01637037d6+100, cookie=<从末尾提取>
 //
 // Delta 机制：
-//   Delta 用于支持同一个文件的多个版本或变体
-//   例如：原图的 needleId 是 100，缩略图可以是 100_1
+//
+//	Delta 用于支持同一个文件的多个版本或变体
+//	例如：原图的 needleId 是 100，缩略图可以是 100_1
 //
 // 参数：
-//   fid: 文件 ID 字符串
+//
+//	fid: 文件 ID 字符串
 //
 // 返回：
-//   err: 解析错误
+//
+//	err: 解析错误
 //
 // 副作用：
-//   设置 n.Id 和 n.Cookie
+//
+//	设置 n.Id 和 n.Cookie
 func (n *Needle) ParsePath(fid string) (err error) {
 	length := len(fid)
 	// fid 长度必须大于 Cookie 大小（Cookie 占用固定长度）
@@ -354,15 +366,17 @@ func (n *Needle) ParsePath(fid string) (err error) {
 // 即使在高并发环境下也能保证时间戳的单调递增。
 //
 // 工作原理：
-//   1. 获取当前系统时间（纳秒）
-//   2. 如果当前时间小于等于上次追加时间，使用 lastTime+1
-//   3. 否则使用当前时间
+//  1. 获取当前系统时间（纳秒）
+//  2. 如果当前时间小于等于上次追加时间，使用 lastTime+1
+//  3. 否则使用当前时间
 //
 // 参数：
-//   volumeLastAppendAtNs: 卷的最后追加时间戳（纳秒）
+//
+//	volumeLastAppendAtNs: 卷的最后追加时间戳（纳秒）
 //
 // 返回：
-//   新的追加时间戳，保证大于 volumeLastAppendAtNs
+//
+//	新的追加时间戳，保证大于 volumeLastAppendAtNs
 //
 // 使用场景：
 //   - 创建新 Needle 时
@@ -377,10 +391,12 @@ func GetAppendAtNs(volumeLastAppendAtNs uint64) uint64 {
 // 与 GetAppendAtNs 类似，但直接更新 Needle 对象的 AppendAtNs 字段。
 //
 // 参数：
-//   volumeLastAppendAtNs: 卷的最后追加时间戳（纳秒）
+//
+//	volumeLastAppendAtNs: 卷的最后追加时间戳（纳秒）
 //
 // 副作用：
-//   设置 n.AppendAtNs 为新的时间戳
+//
+//	设置 n.AppendAtNs 为新的时间戳
 func (n *Needle) UpdateAppendAtNs(volumeLastAppendAtNs uint64) {
 	n.AppendAtNs = max(uint64(time.Now().UnixNano()), volumeLastAppendAtNs+1)
 }
@@ -391,21 +407,24 @@ func (n *Needle) UpdateAppendAtNs(volumeLastAppendAtNs uint64) {
 // 其中 Cookie 占用固定长度（CookieSize*2 个十六进制字符）
 //
 // 解析逻辑：
-//   1. 从字符串末尾提取 CookieSize*2 个字符作为 Cookie
-//   2. 剩余部分作为 NeedleId
+//  1. 从字符串末尾提取 CookieSize*2 个字符作为 Cookie
+//  2. 剩余部分作为 NeedleId
 //
 // 示例：
-//   输入："01637037d6a1b2c3d4"
-//   假设 CookieSize=4（8个十六进制字符）
-//   输出：needleId="01637037d6", cookie="a1b2c3d4"
+//
+//	输入："01637037d6a1b2c3d4"
+//	假设 CookieSize=4（8个十六进制字符）
+//	输出：needleId="01637037d6", cookie="a1b2c3d4"
 //
 // 参数：
-//   key_hash_string: 包含 NeedleId 和 Cookie 的十六进制字符串
+//
+//	key_hash_string: 包含 NeedleId 和 Cookie 的十六进制字符串
 //
 // 返回：
-//   NeedleId: 解析出的 Needle ID
-//   Cookie: 解析出的 Cookie
-//   error: 解析错误
+//
+//	NeedleId: 解析出的 Needle ID
+//	Cookie: 解析出的 Cookie
+//	error: 解析错误
 //
 // 错误情况：
 //   - 字符串太短（小于等于 Cookie 长度）
@@ -447,7 +466,8 @@ func ParseNeedleIdCookie(key_hash_string string) (NeedleId, Cookie, error) {
 // 例如："2024-01-15T14:30:45"
 //
 // 返回：
-//   ISO 8601 格式的时间字符串
+//
+//	ISO 8601 格式的时间字符串
 //
 // 使用场景：
 //   - HTTP 响应的 Last-Modified 头
@@ -460,14 +480,17 @@ func (n *Needle) LastModifiedString() string {
 // max 返回两个 uint64 值中的较大者
 //
 // 参数：
-//   x: 第一个值
-//   y: 第二个值
+//
+//	x: 第一个值
+//	y: 第二个值
 //
 // 返回：
-//   x 和 y 中的较大值
+//
+//	x 和 y 中的较大值
 //
 // 注意：
-//   这是一个工具函数，用于时间戳比较
+//
+//	这是一个工具函数，用于时间戳比较
 func max(x, y uint64) uint64 {
 	if x <= y {
 		return y

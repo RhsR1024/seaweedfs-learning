@@ -140,19 +140,26 @@ func (vs *VolumeServer) tryProxyToReplica(w http.ResponseWriter, r *http.Request
 	return false // no proxy available
 }
 
-// waitForDownloadSlot waits for available download capacity with timeout.
+// waitForDownloadSlot 等待可用的下载容量（带超时机制）
 //
-// This function implements a blocking wait mechanism with timeout for download capacity.
-// It continuously checks if download capacity becomes available and handles timeout
-// and cancellation scenarios appropriately.
+// 此函数实现了一个阻塞等待机制，当下载容量满时等待直到有可用容量或超时
+// 它持续检查下载容量是否变为可用，并适当处理超时和取消场景
 //
-// Returns:
-//   - true:  Download capacity became available, request should proceed
-//   - false: Request failed (timeout or cancellation), error response already sent
+// 返回值：
+//   - true:  下载容量变为可用，请求应继续处理
+//   - false: 请求失败（超时或取消），错误响应已发送
 //
-// HTTP Status Codes:
-//   - 429 Too Many Requests: Wait timeout exceeded
-//   - 499 Client Closed Request: Request cancelled by client
+// HTTP 状态码：
+//   - 429 Too Many Requests: 等待超时
+//   - 499 Client Closed Request: 请求被客户端取消
+//
+// 工作流程：
+//  1. 创建超时计时器（inflightDownloadDataTimeout）
+//  2. 循环检查当前下载数据大小是否降到限制以下
+//  3. 使用条件变量等待，带超时和取消检测
+//  4. 如果超时，返回 429 状态码
+//  5. 如果客户端取消，返回 499 状态码
+//  6. 如果有容量可用，返回 true 继续处理
 func (vs *VolumeServer) waitForDownloadSlot(w http.ResponseWriter, r *http.Request) bool {
 	timerDownload := time.NewTimer(vs.inflightDownloadDataTimeout)
 	defer timerDownload.Stop()
@@ -177,19 +184,24 @@ func (vs *VolumeServer) waitForDownloadSlot(w http.ResponseWriter, r *http.Reque
 	return true
 }
 
-// checkUploadLimit handles upload concurrency limiting with timeout.
+// checkUploadLimit 处理上传并发限制（带超时机制）
 //
-// This function implements upload throttling to prevent overwhelming the volume server
-// with too many concurrent uploads. It excludes replication traffic from limits.
+// 此函数实现上传限流，防止过多的并发上传请求压垮 Volume Server
+// 它会排除副本复制流量，不对其进行限制
 //
-// Returns:
-//   - true:  Request should proceed with upload processing (no limit, within limit,
-//     or successfully waited for capacity)
-//   - false: Request failed (timeout or cancellation), error response already sent
+// 返回值：
+//   - true:  请求应继续上传处理（无限制、在限制内或成功等待到容量）
+//   - false: 请求失败（超时或取消），错误响应已发送
 //
-// Special Handling:
-//   - Replication requests (type=replicate) bypass upload limits
-//   - No upload limit configured (concurrentUploadLimit=0) allows all uploads
+// 特殊处理：
+//   - 副本复制请求（type=replicate）绕过上传限制
+//   - 未配置上传限制（concurrentUploadLimit=0）允许所有上传
+//
+// 工作原理：
+//  1. 检查是否是副本复制请求或未配置限制，是则直接允许
+//  2. 获取当前正在上传的数据大小
+//  3. 如果在限制内，允许继续
+//  4. 如果超限，调用 waitForUploadSlot 等待
 func (vs *VolumeServer) checkUploadLimit(w http.ResponseWriter, r *http.Request) bool {
 	// exclude the replication from the concurrentUploadLimitMB
 	if vs.concurrentUploadLimit == 0 || r.URL.Query().Get("type") == "replicate" {
@@ -206,15 +218,22 @@ func (vs *VolumeServer) checkUploadLimit(w http.ResponseWriter, r *http.Request)
 	return vs.waitForUploadSlot(w, r)
 }
 
-// waitForUploadSlot waits for available upload capacity with timeout.
+// waitForUploadSlot 等待可用的上传容量（带超时机制）
 //
-// Returns:
-//   - true:  Upload capacity became available, request should proceed
-//   - false: Request failed (timeout or cancellation), error response already sent
+// 返回值：
+//   - true:  上传容量变为可用，请求应继续处理
+//   - false: 请求失败（超时或取消），错误响应已发送
 //
-// HTTP Status Codes:
-//   - 429 Too Many Requests: Wait timeout exceeded
-//   - 499 Client Closed Request: Request cancelled by client
+// HTTP 状态码：
+//   - 429 Too Many Requests: 等待超时
+//   - 499 Client Closed Request: 请求被客户端取消
+//
+// 工作流程：
+//  1. 延迟创建超时计时器（只在需要等待时创建，节省资源）
+//  2. 循环检查当前上传数据大小是否降到限制以下
+//  3. 使用条件变量等待，带超时和取消检测
+//  4. 更新 Prometheus 监控指标（UploadLimitCond 计数器）
+//  5. 处理超时、取消和成功等待三种情况
 func (vs *VolumeServer) waitForUploadSlot(w http.ResponseWriter, r *http.Request) bool {
 	var timerUpload *time.Timer
 	inFlightUploadDataSize := atomic.LoadInt64(&vs.inFlightUploadDataSize)
@@ -247,15 +266,18 @@ func (vs *VolumeServer) waitForUploadSlot(w http.ResponseWriter, r *http.Request
 	return true
 }
 
-// handleGetRequest processes GET/HEAD requests with download limiting.
+// handleGetRequest 处理 GET/HEAD 请求（带下载限制）
 //
-// This function orchestrates the complete GET/HEAD request handling workflow:
-// 1. Records read request statistics
-// 2. Applies download concurrency limits with proxy fallback
-// 3. Delegates to GetOrHeadHandler for actual file serving (if limits allow)
+// 此函数编排完整的 GET/HEAD 请求处理工作流：
+// 1. 记录读请求统计（Prometheus 指标）
+// 2. 应用下载并发限制，可能通过代理回退
+// 3. 如果限制允许，委托给 GetOrHeadHandler 进行实际文件服务
 //
-// The download limiting logic may handle the request completely (via proxy,
-// timeout, or error), in which case normal file serving is skipped.
+// 下载限制逻辑可能会完全处理请求（通过代理、超时或错误），
+// 在这种情况下会跳过正常的文件服务流程
+//
+// 调用链：
+//   handleGetRequest -> checkDownloadLimit -> GetOrHeadHandler
 func (vs *VolumeServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	stats.ReadRequest()
 	if vs.checkDownloadLimit(w, r) {
@@ -263,17 +285,25 @@ func (vs *VolumeServer) handleGetRequest(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// handleUploadRequest processes PUT/POST requests with upload limiting.
+// handleUploadRequest 处理 PUT/POST 上传请求（带上传限制）
 //
-// This function manages the complete upload request workflow:
-// 1. Extracts content length from request headers
-// 2. Applies upload concurrency limits with timeout handling
-// 3. Tracks in-flight upload data size for monitoring
-// 4. Delegates to PostHandler for actual file processing
-// 5. Ensures proper cleanup of in-flight counters
+// 此函数管理完整的上传请求工作流：
+// 1. 从请求头中提取内容长度（Content-Length）
+// 2. 应用上传并发限制，可能超时处理
+// 3. 跟踪正在上传的数据大小用于监控
+// 4. 委托给 PostHandler 进行实际文件处理
+// 5. 确保正确清理正在上传计数器
 //
-// The upload limiting logic may reject the request with appropriate HTTP
-// status codes (429 for timeout, 499 for cancellation).
+// 上传限制逻辑可能会拒绝请求并返回适当的 HTTP 状态码：
+//   - 429 Too Many Requests（超时）
+//   - 499 Client Closed Request（取消）
+//
+// 流程：
+//   1. 获取 Content-Length
+//   2. 检查上传限制（可能等待或拒绝）
+//   3. 原子增加 inFlightUploadDataSize
+//   4. 调用 PostHandler 处理上传
+//   5. defer 中原子减少 inFlightUploadDataSize 并广播条件变量
 func (vs *VolumeServer) handleUploadRequest(w http.ResponseWriter, r *http.Request) {
 	contentLength := getContentLength(r)
 
@@ -351,6 +381,22 @@ func (vs *VolumeServer) privateStoreHandler(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+// getContentLength 从 HTTP 请求头中提取 Content-Length 值
+//
+// 这个函数用于获取上传请求的内容大小，主要用途：
+// 1. 并发上传限流：计算当前正在上传的数据总量
+// 2. 资源预分配：提前知道需要多少内存/磁盘空间
+// 3. 进度跟踪：计算上传进度百分比
+//
+// 参数：
+//   r: HTTP 请求对象
+//
+// 返回值：
+//   int64: 请求体的字节大小，解析失败或不存在时返回 0
+//
+// 注意：
+//   - 对于分块传输编码（Transfer-Encoding: chunked），此值可能不准确
+//   - 返回 0 不一定表示没有请求体，可能是头部缺失或格式错误
 func getContentLength(r *http.Request) int64 {
 	contentLength := r.Header.Get("Content-Length")
 	if contentLength != "" {

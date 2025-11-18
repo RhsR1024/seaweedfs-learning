@@ -35,19 +35,58 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
 
+// serverStats 全局服务器统计信息
+// 用于收集和记录服务器的运行统计数据（如请求数、错误数等）
 var serverStats *stats.ServerStats
+
+// startTime 服务器启动时间
+// 用于计算服务器运行时长
 var startTime = time.Now()
+
+// writePool 写入缓冲池
+// 对象池，用于复用 bufio.Writer 对象，避免频繁的内存分配
+// 缓冲区大小：128KB
+//
+// 使用场景：
+//   - HTTP 响应写入
+//   - Range 请求的多部分响应
+//
+// 优势：
+//   - 减少内存分配次数
+//   - 降低 GC 压力
+//   - 提高并发性能
 var writePool = sync.Pool{New: func() interface{} {
 	return bufio.NewWriterSize(nil, 128*1024)
 },
 }
 
+// init 初始化函数
+// 在包导入时自动执行
+//
+// 工作内容:
+//  1. 创建全局服务器统计对象
+//  2. 启动统计数据收集协程
 func init() {
 	serverStats = stats.NewServerStats()
 	go serverStats.Start()
 }
 
-// bodyAllowedForStatus is a copy of http.bodyAllowedForStatus non-exported function.
+// bodyAllowedForStatus 判断 HTTP 状态码是否允许有响应体
+// 这是 http.bodyAllowedForStatus 的复制版本（原版是内部函数）
+//
+// 参数:
+//   - status: HTTP 状态码
+//
+// 返回值:
+//   - bool: true 表示允许有响应体，false 表示不允许
+//
+// 规则:
+//   - 1xx (100-199): 信息性响应，不允许有响应体
+//   - 204 No Content: 明确表示无内容，不允许有响应体
+//   - 304 Not Modified: 缓存相关，不允许有响应体
+//   - 其他状态码: 允许有响应体
+//
+// HTTP 规范参考：RFC 7230, Section 3.3
 func bodyAllowedForStatus(status int) bool {
 	switch {
 	case status >= 100 && status <= 199:
@@ -60,6 +99,38 @@ func bodyAllowedForStatus(status int) bool {
 	return true
 }
 
+// writeJson 将对象序列化为 JSON 并写入 HTTP 响应
+// 支持普通 JSON 响应和 JSONP 回调
+//
+// 参数:
+//   - w: HTTP 响应写入器
+//   - r: HTTP 请求（用于读取 pretty 和 callback 参数）
+//   - httpStatus: HTTP 状态码
+//   - obj: 要序列化的对象
+//
+// 返回值:
+//   - error: 序列化或写入错误
+//
+// 支持的 URL 参数:
+//   - pretty: 如果存在，输出格式化的 JSON（带缩进）
+//   - callback: JSONP 回调函数名（如果存在，输出 JSONP 格式）
+//
+// 响应格式:
+//   - 普通 JSON: {"key": "value"}
+//   - 格式化 JSON: {
+//     "key": "value"
+//     }
+//   - JSONP: callback({"key": "value"})
+//
+// 特殊处理:
+//   - 状态码 >= 400 时，记录详细日志
+//   - 304 Not Modified 或其他不允许响应体的状态码，只发送头部
+//
+// 使用示例:
+//
+//	writeJson(w, r, http.StatusOK, map[string]string{"status": "success"})
+//	// 普通 JSON: ?pretty=1 输出格式化 JSON
+//	// JSONP: ?callback=myFunc 输出 myFunc({"status":"success"})
 func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) (err error) {
 	if !bodyAllowedForStatus(httpStatus) {
 		return
@@ -111,13 +182,46 @@ func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj inter
 	return
 }
 
-// wrapper for writeJson - just logs errors
+// writeJsonQuiet writeJson 的包装函数，自动记录错误
+// 如果写入 JSON 失败，记录错误日志但不返回错误
+//
+// 参数:
+//   - w: HTTP 响应写入器
+//   - r: HTTP 请求
+//   - httpStatus: HTTP 状态码
+//   - obj: 要序列化的对象
+//
+// 使用场景:
+//   - 不需要处理写入错误的场景
+//   - 错误已经在其他地方处理的场景
 func writeJsonQuiet(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) {
 	if err := writeJson(w, r, httpStatus, obj); err != nil {
 		glog.V(0).Infof("error writing JSON status %s %d: %v", r.URL, httpStatus, err)
 		glog.V(1).Infof("JSON content: %+v", obj)
 	}
 }
+
+// writeJsonError 输出错误信息的 JSON 响应
+// 将 error 对象转换为 JSON 格式 {"error": "错误信息"}
+//
+// 参数:
+//   - w: HTTP 响应写入器
+//   - r: HTTP 请求
+//   - httpStatus: HTTP 状态码（通常是 4xx 或 5xx）
+//   - err: 错误对象
+//
+// 输出格式:
+//
+//	{
+//	  "error": "具体的错误信息"
+//	}
+//
+// 使用示例:
+//
+//	if err := processFile(); err != nil {
+//	    writeJsonError(w, r, http.StatusBadRequest, err)
+//	    return
+//	}
 func writeJsonError(w http.ResponseWriter, r *http.Request, httpStatus int, err error) {
 	m := make(map[string]interface{})
 	m["error"] = err.Error()
@@ -125,6 +229,19 @@ func writeJsonError(w http.ResponseWriter, r *http.Request, httpStatus int, err 
 	writeJsonQuiet(w, r, httpStatus, m)
 }
 
+// debug 调试日志输出函数
+// 使用 glog 的 V(4) 级别（最详细的日志级别）
+//
+// 参数:
+//   - params: 任意类型的参数列表
+//
+// 使用方法:
+//   - 启动时添加参数 -v=4 或更高级别才会输出
+//   - 用于调试复杂问题时的详细日志
+//
+// 示例:
+//
+//	debug("processing file", filename, "size:", fileSize)
 func debug(params ...interface{}) {
 	glog.V(4).Infoln(params...)
 }
@@ -328,11 +445,48 @@ func parseURLPath(path string) (vid, fid, filename, ext string, isVolumeIdOnly b
 	return
 }
 
+// statsHealthHandler 健康检查接口处理函数
+// 用于负载均衡器或监控系统检查服务是否存活
+//
+// 路径: /stats/health 或类似
+//
+// 响应格式:
+//
+//	{
+//	  "Version": "3.54"
+//	}
+//
+// 使用场景:
+//   - Kubernetes liveness probe
+//   - 负载均衡器健康检查
+//   - 监控系统状态检测
 func statsHealthHandler(w http.ResponseWriter, r *http.Request) {
 	m := make(map[string]interface{})
 	m["Version"] = version.Version()
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
+
+// statsCounterHandler 统计计数器接口处理函数
+// 返回服务器的运行统计信息（如请求数、成功数、失败数等）
+//
+// 路径: /stats/counter 或类似
+//
+// 响应格式:
+//
+//	{
+//	  "Version": "3.54",
+//	  "Counters": {
+//	    "requests": 12345,
+//	    "successes": 12300,
+//	    "failures": 45,
+//	    ...
+//	  }
+//	}
+//
+// 使用场景:
+//   - 监控系统采集指标
+//   - 性能分析
+//   - 运维监控
 func statsCounterHandler(w http.ResponseWriter, r *http.Request) {
 	m := make(map[string]interface{})
 	m["Version"] = version.Version()
@@ -340,6 +494,28 @@ func statsCounterHandler(w http.ResponseWriter, r *http.Request) {
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
 
+// statsMemoryHandler 内存统计接口处理函数
+// 返回服务器的内存使用情况
+//
+// 路径: /stats/memory 或类似
+//
+// 响应格式:
+//
+//	{
+//	  "Version": "3.54",
+//	  "Memory": {
+//	    "Alloc": 12345678,      // 当前分配的内存
+//	    "TotalAlloc": 98765432,  // 累计分配的内存
+//	    "Sys": 23456789,         // 从系统获取的内存
+//	    "NumGC": 42,             // GC 次数
+//	    ...
+//	  }
+//	}
+//
+// 使用场景:
+//   - 内存泄漏排查
+//   - 性能调优
+//   - 容量规划
 func statsMemoryHandler(w http.ResponseWriter, r *http.Request) {
 	m := make(map[string]interface{})
 	m["Version"] = version.Version()
@@ -347,18 +523,70 @@ func statsMemoryHandler(w http.ResponseWriter, r *http.Request) {
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
 
+// StaticFS 静态资源文件系统
+// 嵌入的静态资源（如 favicon.ico、CSS、JS 等）
 var StaticFS fs.FS
 
+// handleStaticResources 为 http.ServeMux 注册静态资源处理器
+// 用于 Master Server 和 Volume Server 的 Web UI
+//
+// 参数:
+//   - defaultMux: http.ServeMux 路由器
+//
+// 注册的路由:
+//   - /favicon.ico: 网站图标
+//   - /seaweedfsstatic/*: 其他静态资源（CSS、JS、图片等）
+//
+// 使用场景:
+//   - Master Server 的 Web UI
+//   - Volume Server 的管理界面
 func handleStaticResources(defaultMux *http.ServeMux) {
 	defaultMux.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
 	defaultMux.Handle("/seaweedfsstatic/", http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
 }
 
+// handleStaticResources2 为 mux.Router 注册静态资源处理器
+// 与 handleStaticResources 功能相同，但使用 gorilla/mux 路由器
+//
+// 参数:
+//   - r: mux.Router 路由器
+//
+// 注册的路由:
+//   - /favicon.ico: 网站图标
+//   - /seaweedfsstatic/*: 其他静态资源（CSS、JS、图片等）
+//
+// 使用场景:
+//   - Filer Server 的 Web UI
+//   - S3 Gateway 的管理界面
 func handleStaticResources2(r *mux.Router) {
 	r.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
 	r.PathPrefix("/seaweedfsstatic/").Handler(http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
 }
 
+// AdjustPassthroughHeaders 应用 S3 兼容的透传响应头
+// 支持通过 URL 参数覆盖响应头，兼容 AWS S3 API
+//
+// 参数:
+//   - w: HTTP 响应写入器
+//   - r: HTTP 请求（包含 URL 参数）
+//   - filename: 文件名（用于设置 Content-Disposition）
+//
+// 支持的 URL 参数（S3 兼容）:
+//   - response-cache-control: 覆盖 Cache-Control 头
+//   - response-content-disposition: 覆盖 Content-Disposition 头
+//   - response-content-encoding: 覆盖 Content-Encoding 头
+//   - response-content-language: 覆盖 Content-Language 头
+//   - response-content-type: 覆盖 Content-Type 头
+//   - response-expires: 覆盖 Expires 头
+//
+// 使用示例:
+//   GET /3,01e3b0756f?response-content-type=application/json
+//   返回的响应头将包含 Content-Type: application/json
+//
+// 应用场景:
+//   - S3 API 兼容性
+//   - 动态控制缓存策略
+//   - 强制下载或在线预览
 func AdjustPassthroughHeaders(w http.ResponseWriter, r *http.Request, filename string) {
 	// Apply S3 passthrough headers from query parameters
 	// AWS S3 supports overriding response headers via query parameters like:
@@ -370,6 +598,30 @@ func AdjustPassthroughHeaders(w http.ResponseWriter, r *http.Request, filename s
 	}
 	adjustHeaderContentDisposition(w, r, filename)
 }
+
+// adjustHeaderContentDisposition 设置 Content-Disposition 响应头
+// 控制浏览器是在线显示还是下载文件
+//
+// 参数:
+//   - w: HTTP 响应写入器
+//   - r: HTTP 请求（读取 dl 参数）
+//   - filename: 文件名
+//
+// Content-Disposition 类型:
+//   - inline: 浏览器尝试在线显示（默认）
+//   - attachment: 浏览器下载文件（当 dl=true 时）
+//
+// URL 参数:
+//   - dl=true: 强制下载（设置为 attachment）
+//   - dl=false 或不设置: 在线显示（设置为 inline）
+//
+// 响应头示例:
+//   Content-Disposition: inline; filename="photo.jpg"
+//   Content-Disposition: attachment; filename="document.pdf"
+//
+// 注意:
+//   - 如果 Content-Disposition 已存在，不会覆盖
+//   - 文件名会进行 URL 编码，处理特殊字符
 func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, filename string) {
 	if contentDisposition := w.Header().Get("Content-Disposition"); contentDisposition != "" {
 		return
@@ -386,6 +638,54 @@ func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, file
 	}
 }
 
+// ProcessRangeRequest 处理 HTTP Range 请求
+// 支持部分内容读取，用于视频拖拽、断点续传等场景
+//
+// 参数:
+//   - r: HTTP 请求（包含 Range 头）
+//   - w: HTTP 响应写入器
+//   - totalSize: 文件的完整大小（字节）
+//   - mimeType: MIME 类型（如 "video/mp4"）
+//   - prepareWriteFn: 准备数据写入的回调函数
+//   - offset: 要读取的起始位置
+//   - size: 要读取的长度
+//   - 返回: 实际写入数据的函数
+//
+// 返回值:
+//   - error: 处理错误
+//
+// 工作流程:
+//  1. 解析 Range 头（格式：bytes=start-end）
+//  2. 验证 Range 的有效性
+//  3. 单范围请求：返回 206 Partial Content + Content-Range
+//  4. 多范围请求：返回 206 + multipart/byteranges 响应
+//  5. 无 Range 头：返回 200 OK + 完整内容
+//
+// Range 请求示例:
+//   - Range: bytes=0-1023       (前 1KB)
+//   - Range: bytes=1024-2047    (第二个 1KB)
+//   - Range: bytes=1024-        (从 1KB 到末尾)
+//   - Range: bytes=-1024        (最后 1KB)
+//   - Range: bytes=0-1023,2048-3071  (多个范围)
+//
+// 响应示例:
+//   单范围:
+//     HTTP/1.1 206 Partial Content
+//     Content-Range: bytes 0-1023/10240
+//     Content-Length: 1024
+//
+//   多范围:
+//     HTTP/1.1 206 Partial Content
+//     Content-Type: multipart/byteranges; boundary=...
+//
+// 应用场景:
+//   - 视频播放器拖拽
+//   - 断点续传
+//   - 并行下载（多线程下载不同部分）
+//
+// 错误处理:
+//   - 416 Range Not Satisfiable: 范围无效或超出文件大小
+//   - 500 Internal Server Error: 数据读取失败
 func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64, mimeType string, prepareWriteFn func(offset int64, size int64) (filer.DoStreamContent, error)) error {
 	rangeReq := r.Header.Get("Range")
 	bufferedWriter := writePool.Get().(*bufio.Writer)
@@ -518,6 +818,38 @@ func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 	return nil
 }
 
+// requestIDMiddleware HTTP 请求 ID 中间件
+// 为每个请求分配唯一 ID，用于请求追踪和日志关联
+//
+// 参数:
+//   - h: 要包装的处理函数
+//
+// 返回值:
+//   - http.HandlerFunc: 包装后的处理函数
+//
+// 工作流程:
+//  1. 检查请求头是否已有 Request ID
+//  2. 如果没有，生成新的 UUID 作为 Request ID
+//  3. 将 Request ID 存入请求上下文（Context）
+//  4. 将 Request ID 存入 gRPC 元数据（用于 gRPC 调用传递）
+//  5. 将 Request ID 写入响应头
+//  6. 调用实际的处理函数
+//
+// Request ID 的用途:
+//   - 分布式追踪：关联多个服务之间的调用
+//   - 日志聚合：根据 Request ID 查询完整的请求日志
+//   - 问题排查：追踪请求在系统中的完整路径
+//
+// HTTP 头:
+//   - 请求头: X-Amz-Request-Id（如果客户端提供）
+//   - 响应头: X-Amz-Request-Id（返回给客户端）
+//
+// 使用示例:
+//
+//	http.HandleFunc("/upload", requestIDMiddleware(uploadHandler))
+//
+// S3 兼容性:
+//   - 使用 X-Amz-Request-Id 头，兼容 AWS S3 API
 func requestIDMiddleware(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqID := r.Header.Get(request_id.AmzRequestIDHeader)

@@ -5,7 +5,15 @@
       "Bash(git add:*)",
       "Bash(git commit -m \"$(cat <<''EOF''\n为 SeaweedFS 核心模块添加详细中文注释\n\n本次提交为以下核心文件添加了全面的中文注释:\n\n**存储层注释:**\n- weed/storage/needle_map.go: Needle 索引映射接口和实现\n  * NeedleMapKind 索引类型(内存/LevelDB)\n  * NeedleMapper 核心接口定义\n  * baseNeedleMapper 基础实现\n\n- weed/storage/needle/async_request.go: 异步请求处理\n  * AsyncRequest 异步 I/O 结构\n  * WaitComplete/Complete 异步操作方法\n\n- weed/storage/super_block/replica_placement.go: 副本放置策略\n  * ReplicaPlacement 三级副本策略(数据中心/机架/节点)\n  * 副本策略解析和序列化\n\n- weed/storage/super_block/super_block.go: Volume 超级块\n  * SuperBlock 元数据结构\n  * 8字节固定布局和扩展数据支持\n\n**操作层注释:**\n- weed/operation/submit.go: 文件上传核心逻辑\n  * FilePart/SubmitResult 上传结构\n  * 智能分块上传机制\n  * Chunk manifest 管理\n\n- weed/operation/lookup_vid_cache.go: Volume 位置缓存\n  * VidCache O(1) 查询性能\n  * 线程安全的读写锁设计\n  * 缓存过期机制\n\n**工具层注释:**\n- weed/util/network.go: 网络地址工具\n  * DetectedHostAddress 自动检测主机地址\n  * IPv4/IPv6 地址选择\n  * JoinHostPort 地址格式化\n\n注释特点:\n- 详细说明每个结构体、字段和函数的用途\n- 包含参数、返回值和使用示例\n- 说明关键算法和设计思路\n- 标注重要的注意事项\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
       "Bash(git commit -m \"$(cat <<''EOF''\n为 SeaweedFS Volume Server 启动流程添加详细中文注释\n\n本次提交为 Volume Server 的启动和初始化流程添加了完整的中文注释：\n\n**weed/command/volume.go - Volume Server 启动入口**\n\n核心功能注释：\n\n1. **runVolume** - 启动入口函数\n   - 安全配置加载（JWT、TLS）\n   - 性能分析配置（pprof、CPU/内存 profiling）\n   - Prometheus 监控服务启动\n   - Master 节点配置解析\n   - Volume Server 初始化和启动流程\n\n2. **startVolumeServer** - 核心初始化方法（分4个阶段）\n   \n   【阶段 1：配置验证和解析】\n   - 解析和验证存储目录配置\n   - 解析卷数量限制（支持多目录配置）\n   - 解析磁盘空间限制\n   - 解析磁盘类型配置（HDD/SSD）\n   - 配置网络地址和端口\n\n   【阶段 2：创建服务组件】\n   - 创建 HTTP 路由器（管理端口和公共端口）\n   - 选择 Needle 索引类型（内存/LevelDB/LevelDB Medium/Large）\n   - 创建 VolumeServer 实例\n   - Volume 加载流程说明：\n     * 扫描数据目录识别 .dat 和 .idx 文件\n     * 验证文件完整性\n     * 加载 SuperBlock 元数据\n     * 根据索引类型加载 Needle 索引\n     * 加载 EC Volume 分片\n\n   【阶段 3：启动服务】\n   - 启动 gRPC 服务器（节点间通信）\n   - 启动公共 HTTP 服务器（文件访问）\n   - 启动集群 HTTP 服务器（管理操作）\n\n   【阶段 4：生命周期管理】\n   - 注册热重载回调（SIGHUP 信号处理）\n   - 注册优雅关闭回调（SIGTERM/SIGINT 信号处理）\n   - 阻塞主线程等待关闭信号\n\n3. **shutdown** - 优雅关闭函数\n   - 详细说明关闭顺序的重要性\n   - 确保数据安全和资源释放\n\n4. **辅助函数注释**\n   - isSeparatedPublicPort: 端口分离检查\n   - startGrpcService: gRPC 服务器启动（含 TLS、反射服务）\n   - startPublicHttpService: 公共 HTTP 服务器启动（含优雅关闭）\n   - startClusterHttpService: 集群 HTTP 服务器启动（含 mTLS）\n\n**注释特点：**\n- 清晰标注 4 个初始化阶段，便于理解整体流程\n- 详细说明 Needle 索引类型的内存/性能权衡\n- 解释端口分离的安全和性能优势\n- 说明优雅关闭的顺序和重要性\n- 包含配置示例和使用场景\n- 标注关键的并发安全点\n\n这是 SeaweedFS 最核心的启动流程，此文件是理解 Volume、Needle 等组件\n如何初始化和加载的关键入口。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(go version:*)",
+      "Bash(go env:*)",
+      "Bash(go build:*)",
+      "Bash(gopls check:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(xargs -I {} sh -c 'echo \"\"\"\"=== {} ===\"\"\"\" && head -3 {}')",
+      "Bash(go list:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []

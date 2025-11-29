@@ -114,10 +114,14 @@ package xxx
 
 | 文件 | 构建约束 | 原因 |
 |------|---------|------|
-| `test/postgres/client.go` | `!windows && postgres_client` | 避免 main 函数冲突 + PostgreSQL 测试 |
-| `test/postgres/producer.go` | `!windows && postgres_producer` | 避免 main 函数冲突 + 消息队列测试 |
+| `test/postgres/client.go` | `postgres_client` | 避免 main 函数冲突 |
+| `test/postgres/producer.go` | `postgres_producer` | 避免 main 函数冲突 |
 
-**特殊说明**：这两个文件都在 `package main` 下定义了 `main()` 函数，使用不同的构建标签隔离：
+**特殊说明**：这两个文件都在 `package main` 下定义了 `main()` 函数，使用不同的构建标签隔离。
+
+**Windows 兼容性**：这两个文件**可以在 Windows 上编译**，因为它们只使用标准库和跨平台的第三方库（PostgreSQL 驱动）。
+
+编译示例：
 
 ```bash
 # 编译 client

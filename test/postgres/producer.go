@@ -1,5 +1,5 @@
-//go:build !windows && postgres_producer
-// +build !windows,postgres_producer
+//go:build postgres_producer
+// +build postgres_producer
 
 package main
 

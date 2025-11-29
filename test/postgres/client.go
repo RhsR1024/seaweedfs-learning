@@ -1,5 +1,5 @@
-//go:build !windows && postgres_client
-// +build !windows,postgres_client
+//go:build postgres_client
+// +build postgres_client
 
 package main
 

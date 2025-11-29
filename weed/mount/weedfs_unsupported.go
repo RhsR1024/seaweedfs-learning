@@ -1,3 +1,6 @@
+//go:build !windows
+// +build !windows
+
 package mount
 
 import "github.com/hanwen/go-fuse/v2/fuse"

@@ -1,3 +1,6 @@
+//go:build !windows && postgres_producer
+// +build !windows,postgres_producer
+
 package main
 
 import (

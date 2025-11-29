@@ -1,8 +1,12 @@
+//go:build !windows
+// +build !windows
+
 package mount
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/util"
 	"testing"
+
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func TestInodeEntry_removeOnePath(t *testing.T) {

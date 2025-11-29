@@ -325,8 +325,8 @@ func discoverFiler(masterHTTPAddress string) (string, error) {
 
 	// Use the first available filer and convert HTTP address to gRPC
 	filerHTTPAddress := resp.ClusterNodes[0].Address
-	httpAddr := pb.ServerAddress(filerHTTPAddress)
-	return httpAddr.ToGrpcAddress(), nil
+	filerAddr := pb.ServerAddress(filerHTTPAddress)
+	return filerAddr.ToGrpcAddress(), nil
 }
 
 // discoverBroker finds the broker balancer using filer lock mechanism

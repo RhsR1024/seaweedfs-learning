@@ -1,3 +1,31 @@
+// Package topology 的测试包
+// 本文件实现容量预留（Capacity Reservation）机制的压力测试
+//
+// 测试目标：
+//   验证在高并发场景下，容量预留机制能够防止 Volume 分配超额
+//
+// 问题背景：
+//   在 SeaweedFS 的实际使用中，用户报告了容量判断错误的问题：
+//   - 集群配置：3 台 Volume Server，每台 200GB，Volume 大小限制 5GB
+//   - 理论容量：每台最多 40 个 Volume（200GB / 5GB）
+//   - 问题现象：高并发写入时，某些 Volume Server 的 Volume 数量超过 40
+//   - 根本原因：并发分配 Volume 时，多个请求同时读取到相同的可用容量，
+//              导致分配决策基于过期的容量信息
+//
+// 解决方案：
+//   引入容量预留（Capacity Reservation）机制：
+//   1. 在分配 Volume 前，先"预留"容量（类似数据库的乐观锁）
+//   2. 预留成功后，其他请求查询容量时会扣除已预留的部分
+//   3. Volume 创建成功后，释放预留
+//   4. 预留会自动过期（默认 5 分钟），防止预留泄漏
+//
+// 测试策略：
+//   1. 模拟原始问题场景：高并发请求（50 个并发）
+//   2. 验证容量限制不被突破
+//   3. 检查分配结果的正确性
+//
+// 相关 Issue：
+//   https://github.com/seaweedfs/seaweedfs/issues/xxxx
 package topology
 
 import (
@@ -12,8 +40,25 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
-// TestRaceConditionStress simulates the original issue scenario:
-// High concurrent writes causing capacity misjudgment
+// TestRaceConditionStress 模拟原始问题场景：高并发写入导致容量误判
+//
+// 测试场景设置：
+//   - 3 台 Volume Server
+//   - 每台 200GB 存储空间
+//   - Volume 大小限制 5GB
+//   - 最大容量：每台 40 个 Volume（200 * 1024 / 5000 = 40.96）
+//   - 并发请求：50 个（超过总容量 120）
+//
+// 测试验证点：
+//   1. 任何单台服务器的 Volume 数量不超过 40（防止超额分配）
+//   2. 集群总 Volume 数量不超过 120（3 * 40）
+//   3. 成功分配数 + 失败数 = 总请求数（无请求丢失）
+//   4. 分配的 Volume 正确记录在拓扑中
+//
+// 预期结果：
+//   - 使用容量预留机制后，不会出现超额分配
+//   - 前 120 个请求成功，后 30 个请求失败
+//   - 每台服务器的 Volume 数量≤40
 func TestRaceConditionStress(t *testing.T) {
 	// Create a cluster similar to the issue description:
 	// 3 volume servers, 200GB each, 5GB volume limit = 40 volumes max per server
@@ -147,8 +192,39 @@ func TestRaceConditionStress(t *testing.T) {
 		concurrentRequests)
 }
 
-// TestCapacityJudgmentAccuracy verifies that the capacity calculation is accurate
-// under various load conditions
+// TestCapacityJudgmentAccuracy 验证容量计算的准确性
+// 在各种负载条件下，确保容量预留和实际使用统计的一致性
+//
+// 测试目标：
+//   1. 验证 AvailableSpaceFor 返回的可用容量是准确的
+//   2. 验证 AvailableSpaceForReservation 正确扣除已预留的容量
+//   3. 验证容量预留后，可用容量立即减少
+//   4. 验证 Volume 创建后，可用容量进一步减少
+//   5. 验证达到容量上限后，预留请求正确失败
+//
+// 测试场景：
+//   - 单台 Volume Server，容量为 10 个 Volume
+//   - 顺序创建 10 个 Volume，每次检查容量计算
+//   - 在每个步骤验证：预留前容量、预留后容量、创建后容量
+//   - 最后验证第 11 个预留请求失败
+//
+// 测试步骤（循环 10 次）：
+//   1. 检查预留前的可用容量（期望：10-i）
+//   2. 执行容量预留（期望成功）
+//   3. 检查预留后的可用容量（期望：10-i-1）
+//   4. 模拟 Volume 创建（更新磁盘使用统计）
+//   5. 释放预留
+//   6. 检查创建后的可用容量（期望：10-i-1）
+//
+// 验证点：
+//   - 容量计算的准确性（每一步都验证期望值）
+//   - 预留和创建的原子性（容量变化的顺序正确）
+//   - 边界情况处理（达到上限时正确拒绝）
+//
+// 预期结果：
+//   - 前 10 次预留和创建都成功
+//   - 每次操作后，可用容量正确减少
+//   - 第 11 次预留失败（容量已满）
 func TestCapacityJudgmentAccuracy(t *testing.T) {
 	// Create a single server with known capacity
 	topo := NewTopology("weedfs", sequence.NewMemorySequencer(), 5*1024*1024*1024, 5, false)
@@ -250,7 +326,45 @@ func TestCapacityJudgmentAccuracy(t *testing.T) {
 	t.Logf("Capacity judgment accuracy test passed")
 }
 
-// TestReservationSystemPerformance measures the performance impact of reservations
+// TestReservationSystemPerformance 测试容量预留系统的性能影响
+// 通过大量预留操作，评估预留机制的性能开销
+//
+// 测试目标：
+//   1. 测量单次容量预留操作的平均耗时
+//   2. 验证预留机制不会成为性能瓶颈
+//   3. 确保预留系统在高负载下仍然高效
+//
+// 测试场景：
+//   - 单台 Volume Server，容量为 1000 个 Volume
+//   - 执行 1000 次预留-释放循环
+//   - 记录总耗时和平均耗时
+//
+// 测试步骤：
+//   1. 创建拓扑结构（1 个 DataCenter、1 个 Rack、1 个 DataNode）
+//   2. 设置 DataNode 容量为 1000 个 Volume
+//   3. 循环 1000 次：
+//      a. 调用 findEmptySlotsForOneVolume 预留容量
+//      b. 立即释放预留
+//      c. 模拟 Volume 创建（更新 volumeCount）
+//   4. 计算总耗时和平均耗时
+//
+// 性能期望：
+//   - 平均每次预留操作耗时 < 1ms
+//   - 如果超过 1ms，说明预留机制可能存在性能问题
+//
+// 性能考虑：
+//   - 预留操作包含的主要开销：
+//     * 获取/释放互斥锁（sync.Mutex）
+//     * 生成 UUID（reservationId）
+//     * 原子操作（atomic.AddInt64）
+//     * 映射操作（map 插入/删除）
+//   - 这些操作都是 O(1) 时间复杂度
+//   - 预期性能应该在微秒级别，1ms 是非常宽松的阈值
+//
+// 预期结果：
+//   - 1000 次预留操作总耗时远小于 1 秒
+//   - 平均耗时远小于 1ms（通常在 10-100 微秒）
+//   - 测试通过，说明预留机制性能足够好
 func TestReservationSystemPerformance(t *testing.T) {
 	// Create topology
 	topo := NewTopology("weedfs", sequence.NewMemorySequencer(), 32*1024, 5, false)

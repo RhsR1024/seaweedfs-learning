@@ -1,3 +1,5 @@
+// Package topology 实现了 SeaweedFS 的拓扑管理
+// 本文件定义 VolumeLayout，管理单个副本配置的所有卷
 package topology
 
 import (
@@ -17,40 +19,69 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 )
 
+// copyState 副本状态枚举
+// 用于判断卷的副本数量是否满足要求
 type copyState int
 
 const (
+	// noCopies 没有副本（卷不存在或所有副本都下线）
 	noCopies copyState = 0 + iota
+	// insufficientCopies 副本数不足（少于 ReplicaPlacement 要求）
 	insufficientCopies
+	// enoughCopies 副本数充足（满足或超过 ReplicaPlacement 要求）
 	enoughCopies
 )
 
+// volumeState 卷状态字符串
+// 用于标识卷的特殊状态
 type volumeState string
 
 const (
-	readOnlyState     volumeState = "ReadOnly"
-	oversizedState                = "Oversized"
-	crowdedState                  = "Crowded"
-	NoWritableVolumes             = "No writable volumes"
+	// readOnlyState 只读状态（卷被标记为只读）
+	readOnlyState volumeState = "ReadOnly"
+	// oversizedState 过大状态（卷大小超过限制）
+	oversizedState = "Oversized"
+	// crowdedState 拥挤状态（卷使用率超过阈值，应创建新卷）
+	crowdedState = "Crowded"
+	// NoWritableVolumes 错误消息：没有可写卷
+	NoWritableVolumes = "No writable volumes"
 )
 
+// stateIndicator 状态指示器函数类型
+// 根据 copyState 判断卷是否应该标记为某种状态
 type stateIndicator func(copyState) bool
 
+// ExistCopies 创建"存在副本"状态指示器
+// 当至少有一个副本时返回 true
+// 用于 readOnlyState 和 oversizedState
 func ExistCopies() stateIndicator {
 	return func(state copyState) bool { return state != noCopies }
 }
 
+// NoCopies 创建"没有副本"状态指示器
+// 当没有任何副本时返回 true
+// 用于反向逻辑（例如标记应该清理的卷）
 func NoCopies() stateIndicator {
 	return func(state copyState) bool { return state == noCopies }
 }
 
+// volumesBinaryState 卷的二进制状态跟踪器
+// 用于跟踪卷的某种二进制状态（是/否），例如：
+//   - 只读状态：卷是否为只读
+//   - 过大状态：卷是否超过大小限制
+//
+// 工作原理：
+//   1. 维护每个卷的副本位置列表
+//   2. 根据副本数量（copyState）和状态指示器（indicator）判断状态
+//   3. 提供 Add/Remove 方法动态更新副本列表
 type volumesBinaryState struct {
-	rp        *super_block.ReplicaPlacement
-	name      volumeState    // the name for volume state (eg. "Readonly", "Oversized")
-	indicator stateIndicator // indicate whether the volumes should be marked as `name`
-	copyMap   map[needle.VolumeId]*VolumeLocationList
+	rp        *super_block.ReplicaPlacement // 副本放置策略
+	name      volumeState                    // 状态名称（如 "ReadOnly", "Oversized"）
+	indicator stateIndicator                 // 状态指示器：判断卷是否应该标记为此状态
+	copyMap   map[needle.VolumeId]*VolumeLocationList // 卷 ID → 副本位置列表
 }
 
+// NewVolumesBinaryState 创建新的卷二进制状态跟踪器
 func NewVolumesBinaryState(name volumeState, rp *super_block.ReplicaPlacement, indicator stateIndicator) *volumesBinaryState {
 	return &volumesBinaryState{
 		rp:        rp,
@@ -60,6 +91,8 @@ func NewVolumesBinaryState(name volumeState, rp *super_block.ReplicaPlacement, i
 	}
 }
 
+// Dump 返回所有标记为此状态的卷 ID 列表
+// 遍历所有卷，根据状态指示器判断是否应该标记
 func (v *volumesBinaryState) Dump() (res []uint32) {
 	for vid, list := range v.copyMap {
 		if v.indicator(v.copyState(list)) {
@@ -69,32 +102,43 @@ func (v *volumesBinaryState) Dump() (res []uint32) {
 	return
 }
 
+// IsTrue 判断指定卷是否标记为此状态
+// 使用状态指示器和副本状态进行判断
 func (v *volumesBinaryState) IsTrue(vid needle.VolumeId) bool {
 	list, _ := v.copyMap[vid]
 	return v.indicator(v.copyState(list))
 }
 
+// Add 添加一个副本位置到卷的副本列表
+// 如果卷不存在，创建新的副本列表
 func (v *volumesBinaryState) Add(vid needle.VolumeId, dn *DataNode) {
 	list, _ := v.copyMap[vid]
 	if list != nil {
+		// 卷已存在，添加或更新副本位置
 		list.Set(dn)
 		return
 	}
+	// 卷不存在，创建新的副本列表
 	list = NewVolumeLocationList()
 	list.Set(dn)
 	v.copyMap[vid] = list
 }
 
+// Remove 从卷的副本列表中移除一个副本位置
+// 如果副本列表变为空，删除整个卷记录
 func (v *volumesBinaryState) Remove(vid needle.VolumeId, dn *DataNode) {
 	list, _ := v.copyMap[vid]
 	if list != nil {
 		list.Remove(dn)
+		// 如果没有副本了，删除卷记录
 		if list.Length() == 0 {
 			delete(v.copyMap, vid)
 		}
 	}
 }
 
+// copyState 计算卷的副本状态
+// 根据副本数量和副本策略要求判断
 func (v *volumesBinaryState) copyState(list *VolumeLocationList) copyState {
 	if list == nil {
 		return noCopies
@@ -105,30 +149,53 @@ func (v *volumesBinaryState) copyState(list *VolumeLocationList) copyState {
 	return enoughCopies
 }
 
-// mapping from volume to its locations, inverted from server to volume
+// VolumeLayout 管理具有相同配置的所有卷
+// 核心职责：
+//   1. 维护卷 ID 到副本位置的映射（vid2location）
+//   2. 管理可写卷列表（writables）
+//   3. 跟踪只读卷、过大卷、拥挤卷
+//   4. 提供卷选择逻辑（PickForWrite）
+//
+// 分组维度：
+//   - 同一个 VolumeLayout 的所有卷具有相同的：
+//     * 副本策略（ReplicaPlacement）
+//     * TTL（生存时间）
+//     * 磁盘类型（DiskType）
+//
+// 与 Server-to-Volume 的反向映射：
+//   - 在 DataNode 中存储：Server → Volume 列表
+//   - 在 VolumeLayout 中存储：Volume → Server 列表（副本位置）
 type VolumeLayout struct {
-	growRequest      atomic.Bool
-	lastGrowCount    atomic.Uint32
-	rp               *super_block.ReplicaPlacement
-	ttl              *needle.TTL
-	diskType         types.DiskType
-	vid2location     map[needle.VolumeId]*VolumeLocationList
-	writables        []needle.VolumeId // transient array of writable volume id
-	crowded          map[needle.VolumeId]struct{}
-	readonlyVolumes  *volumesBinaryState // readonly volumes
-	oversizedVolumes *volumesBinaryState // oversized volumes
-	vacuumedVolumes  map[needle.VolumeId]time.Time
-	volumeSizeLimit  uint64
-	replicationAsMin bool
-	accessLock       sync.RWMutex
+	growRequest      atomic.Bool   // 是否有待处理的卷增长请求
+	lastGrowCount    atomic.Uint32 // 上次增长创建的卷数量
+	rp               *super_block.ReplicaPlacement // 副本放置策略
+	ttl              *needle.TTL                   // 生存时间
+	diskType         types.DiskType                // 磁盘类型（HDD/SSD）
+	vid2location     map[needle.VolumeId]*VolumeLocationList // 卷 ID → 副本位置列表
+	writables        []needle.VolumeId                       // 可写卷 ID 列表（动态变化）
+	crowded          map[needle.VolumeId]struct{}            // 拥挤卷集合（接近容量限制）
+	readonlyVolumes  *volumesBinaryState                     // 只读卷跟踪器
+	oversizedVolumes *volumesBinaryState                     // 过大卷跟踪器
+	vacuumedVolumes  map[needle.VolumeId]time.Time           // 已清理卷及清理时间
+	volumeSizeLimit  uint64                                  // 卷大小限制（字节）
+	replicationAsMin bool                                    // 是否将副本数作为最小值（允许超额副本）
+	accessLock       sync.RWMutex                            // 读写锁保护并发访问
 }
 
+// VolumeLayoutStats 卷布局的统计信息
 type VolumeLayoutStats struct {
-	TotalSize uint64
-	UsedSize  uint64
-	FileCount uint64
+	TotalSize uint64 // 总容量（包含未使用空间）
+	UsedSize  uint64 // 已使用空间
+	FileCount uint64 // 文件数量
 }
 
+// NewVolumeLayout 创建新的卷布局
+// 参数：
+//   - rp: 副本放置策略
+//   - ttl: 生存时间
+//   - diskType: 磁盘类型
+//   - volumeSizeLimit: 单个卷的大小限制
+//   - replicationAsMin: 是否允许超额副本
 func NewVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType, volumeSizeLimit uint64, replicationAsMin bool) *VolumeLayout {
 	return &VolumeLayout{
 		rp:               rp,
@@ -145,6 +212,8 @@ func NewVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType
 	}
 }
 
+// String 返回卷布局的字符串表示
+// 用于日志输出和调试
 func (vl *VolumeLayout) String() string {
 	return fmt.Sprintf("rp:%v, ttl:%v, writables:%v, volumeSizeLimit:%v", vl.rp, vl.ttl, vl.writables, vl.volumeSizeLimit)
 }

@@ -1,3 +1,9 @@
+// Package topology 的测试文件
+// 本文件测试卷增长（VolumeGrowth）的核心功能，包括：
+//   1. findEmptySlotsForOneVolume: 查找空闲槽位
+//   2. 副本放置策略的正确性
+//   3. 加权调度算法
+//   4. PickForWrite: 选择可写卷
 package topology
 
 import (
@@ -13,6 +19,21 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 )
 
+// topologyLayout 定义测试用的拓扑结构
+// JSON 格式：数据中心 → 机架 → 服务器 → 卷列表
+//
+// 拓扑结构：
+//   dc1:
+//     rack1: 2 台服务器（server111 满载，server112 有空间）
+//     rack2: 3 台服务器（server121 接近满载，server122 空闲，server123 有空间）
+//   dc2: 空数据中心（用于测试失败场景）
+//   dc3:
+//     rack2: 1 台服务器（server321 有空间）
+//
+// 注意：
+//   - "limit" 表示服务器的最大卷数量
+//   - "volumes" 表示服务器当前的卷列表
+//   - 可用空间 = limit - len(volumes)
 var topologyLayout = `
 {
   "dc1":{
@@ -74,7 +95,19 @@ var topologyLayout = `
 }
 `
 
+// setup 根据 JSON 配置构建测试用的拓扑结构
+// 执行流程：
+//   1. 解析 JSON 配置
+//   2. 创建拓扑树：Topology → DataCenter → Rack → DataNode
+//   3. 为每个服务器添加现有的卷
+//   4. 设置服务器的容量限制
+//
+// 参数:
+//   - topologyLayout: JSON 格式的拓扑配置
+// 返回:
+//   - *Topology: 构建好的拓扑对象
 func setup(topologyLayout string) *Topology {
+	// 【步骤 1：解析 JSON 配置】
 	var data interface{}
 	err := json.Unmarshal([]byte(topologyLayout), &data)
 	if err != nil {
@@ -82,51 +115,80 @@ func setup(topologyLayout string) *Topology {
 	}
 	fmt.Println("data:", data)
 
-	//need to connect all nodes first before server adding volumes
+	// 【步骤 2：创建根拓扑节点】
+	// 参数说明：
+	//   - "weedfs": 拓扑名称
+	//   - sequence.NewMemorySequencer(): 内存序列生成器（用于分配 Volume ID）
+	//   - 32*1024: 卷大小限制（32KB，测试用）
+	//   - 5: 心跳间隔（秒）
+	//   - false: 不使用默认副本策略
 	topo := NewTopology("weedfs", sequence.NewMemorySequencer(), 32*1024, 5, false)
+
+	// 【步骤 3：构建拓扑树结构】
 	mTopology := data.(map[string]interface{})
+
+	// 遍历数据中心
 	for dcKey, dcValue := range mTopology {
 		dc := NewDataCenter(dcKey)
 		dcMap := dcValue.(map[string]interface{})
-		topo.LinkChildNode(dc)
+		topo.LinkChildNode(dc) // 将数据中心链接到拓扑根节点
+
+		// 遍历机架
 		for rackKey, rackValue := range dcMap {
 			dcRack := NewRack(rackKey)
 			rackMap := rackValue.(map[string]interface{})
-			dc.LinkChildNode(dcRack)
+			dc.LinkChildNode(dcRack) // 将机架链接到数据中心
+
+			// 遍历服务器
 			for serverKey, serverValue := range rackMap {
 				server := NewDataNode(serverKey)
 				serverMap := serverValue.(map[string]interface{})
+
+				// 设置服务器 IP（可选）
 				if ip, ok := serverMap["ip"]; ok {
 					server.Ip = ip.(string)
 				}
-				dcRack.LinkChildNode(server)
+				dcRack.LinkChildNode(server) // 将服务器链接到机架
+
+				// 【步骤 4：为服务器添加现有的卷】
 				for _, v := range serverMap["volumes"].([]interface{}) {
 					m := v.(map[string]interface{})
+					// 创建卷信息对象
 					vi := storage.VolumeInfo{
-						Id:      needle.VolumeId(int64(m["id"].(float64))),
-						Size:    uint64(m["size"].(float64)),
-						Version: needle.GetCurrentVersion(),
+						Id:      needle.VolumeId(int64(m["id"].(float64))),     // Volume ID
+						Size:    uint64(m["size"].(float64)),                   // 卷大小
+						Version: needle.GetCurrentVersion(),                     // 卷版本
 					}
+
+					// 设置集合名称（可选）
 					if mVal, ok := m["collection"]; ok {
 						vi.Collection = mVal.(string)
 					}
+
+					// 设置副本策略（可选）
 					if mVal, ok := m["replication"]; ok {
 						rp, _ := super_block.NewReplicaPlacementFromString(mVal.(string))
 						vi.ReplicaPlacement = rp
 					}
+
+					// 如果有副本策略，注册到 VolumeLayout
 					if vi.ReplicaPlacement != nil {
 						vl := topo.GetVolumeLayout(vi.Collection, vi.ReplicaPlacement, needle.EMPTY_TTL, types.HardDriveType)
-						vl.RegisterVolume(&vi, server)
-						vl.setVolumeWritable(vi.Id)
+						vl.RegisterVolume(&vi, server)    // 注册卷位置
+						vl.setVolumeWritable(vi.Id)       // 标记为可写
 					}
+
+					// 在服务器上添加卷信息
 					server.AddOrUpdateVolume(vi)
 				}
 
+				// 【步骤 5：设置服务器的容量限制】
+				// 获取或创建磁盘对象
 				disk := server.getOrCreateDisk("")
+				// 调整磁盘使用统计（设置最大卷数量）
 				disk.UpAdjustDiskUsageDelta("", &DiskUsageCounts{
 					maxVolumeCount: int64(serverMap["limit"].(float64)),
 				})
-
 			}
 		}
 	}
@@ -134,22 +196,48 @@ func setup(topologyLayout string) *Topology {
 	return topo
 }
 
+// TestFindEmptySlotsForOneVolume 测试查找空闲槽位的核心功能
+// 测试场景：在 dc1 数据中心内创建一个需要 3 个副本的卷
+//
+// 副本策略 "002" 解析：
+//   - 0 个跨数据中心副本
+//   - 0 个跨机架副本（同数据中心）
+//   - 2 个同机架副本（同机架不同服务器）
+//   - 总共需要 3 个副本：1 个主副本 + 2 个同机架副本
+//
+// 预期结果：
+//   - 从 dc1 的某个机架中选择 3 台不同的服务器
+//   - 所有服务器都在同一个机架（因为 DiffRackCount=0）
+//   - 打印选中的服务器列表
 func TestFindEmptySlotsForOneVolume(t *testing.T) {
+	// 【准备测试环境】
 	topo := setup(topologyLayout)
 	vg := NewDefaultVolumeGrowth()
+
+	// 【定义副本策略】
+	// "002": 同机架 2 个副本（共 3 个副本）
 	rp, _ := super_block.NewReplicaPlacementFromString("002")
+
+	// 【定义卷增长选项】
 	volumeGrowOption := &VolumeGrowOption{
-		Collection:       "",
-		ReplicaPlacement: rp,
-		DataCenter:       "dc1",
-		Rack:             "",
-		DataNode:         "",
+		Collection:       "",      // 不指定集合
+		ReplicaPlacement: rp,      // 副本策略
+		DataCenter:       "dc1",   // 指定数据中心（dc1）
+		Rack:             "",      // 不指定机架（自动选择）
+		DataNode:         "",      // 不指定节点（自动选择）
 	}
+
+	// 【执行查找】
+	// useReservations=false：不使用容量预留机制
 	servers, _, err := vg.findEmptySlotsForOneVolume(topo, volumeGrowOption, false)
+
+	// 【验证结果】
 	if err != nil {
 		fmt.Println("finding empty slots error :", err)
 		t.Fail()
 	}
+
+	// 打印选中的服务器（用于调试）
 	for _, server := range servers {
 		fmt.Println("assigned node :", server.Id())
 	}

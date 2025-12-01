@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_write_merge.go 负责小块合并逻辑
+// 在写入过程中通过合并大量碎片块以提升读性能并减少索引项。
 package weed_server
 
 import (
@@ -14,16 +16,18 @@ import (
 
 const MergeChunkMinCount int = 1000
 
+// maybeMergeChunks 根据 chunk 数量与大小判断是否需要合并
+// 若满足阈值则调用 mergeChunks，否则直接返回原列表
 func (fs *FilerServer) maybeMergeChunks(ctx context.Context, so *operation.StorageOption, inputChunks []*filer_pb.FileChunk) (mergedChunks []*filer_pb.FileChunk, err error) {
-	// Don't merge SSE-encrypted chunks to preserve per-chunk metadata
+	// SSE 加密的 chunk 需要保留原始元数据，这里直接跳过合并
 	for _, chunk := range inputChunks {
-		if chunk.GetSseType() != 0 { // Any SSE type (SSE-C or SSE-KMS)
+		if chunk.GetSseType() != 0 { // 只要是 SSE 类型（SSE-C 或 SSE-KMS）便跳过合并
 			glog.V(3).InfofCtx(ctx, "Skipping chunk merge for SSE-encrypted chunks")
 			return inputChunks, nil
 		}
 	}
 
-	// Only merge small chunks more than half of the file
+	// 仅当小块数量超过文件的一半且数量达到阈值时才进行合并
 	var chunkSize = fs.option.MaxMB * 1024 * 1024
 	var smallChunk, sumChunk int
 	var minOffset int64 = math.MaxInt64
@@ -46,6 +50,8 @@ func (fs *FilerServer) maybeMergeChunks(ctx context.Context, so *operation.Stora
 	return fs.mergeChunks(ctx, so, inputChunks, minOffset)
 }
 
+// mergeChunks 执行真正的合并操作
+// 会重读原 chunk 数据上传为新的大块，并在完成后删除冗余数据
 func (fs *FilerServer) mergeChunks(ctx context.Context, so *operation.StorageOption, inputChunks []*filer_pb.FileChunk, chunkOffset int64) (mergedChunks []*filer_pb.FileChunk, mergeErr error) {
 	chunkedFileReader := filer.NewChunkStreamReaderFromFiler(ctx, fs.filer.MasterClient, inputChunks)
 	_, mergeErr = chunkedFileReader.Seek(chunkOffset, io.SeekCurrent)

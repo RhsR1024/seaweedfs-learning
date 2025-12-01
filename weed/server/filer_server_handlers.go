@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers.go 负责 Filer HTTP API 的请求入口
+// 在此统一实现鉴权、CORS、统计上报等横切关注点。
 package weed_server
 
 import (
@@ -18,6 +20,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 )
 
+// filerHandler 是 Filer HTTP API 的入口
+// 支持 CORS、JWT 校验、Volume Proxy 以及统计指标记录
+// 参数:
+//   - w/r: 标准 HTTP 处理器接口
 func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
@@ -122,6 +128,8 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// readonlyFilerHandler 仅允许 GET/HEAD 的 Filer 读请求入口
+// 使用单独的 mux 绑定到只读端口，避免误写
 func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
@@ -178,6 +186,8 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+// OptionsHandler 处理 HTTP OPTIONS 预检请求
+// 当 isReadOnly 为 true 时拒绝可能触发写操作的方法
 func OptionsHandler(w http.ResponseWriter, r *http.Request, isReadOnly bool) {
 	if isReadOnly {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -190,6 +200,8 @@ func OptionsHandler(w http.ResponseWriter, r *http.Request, isReadOnly bool) {
 }
 
 // maybeCheckJwtAuthorization returns true if access should be granted, false if it should be denied
+// maybeCheckJwtAuthorization 校验请求头中的 JWT 是否有效
+// 参数 isWrite 控制当前操作是否需要写权限令牌
 func (fs *FilerServer) maybeCheckJwtAuthorization(r *http.Request, isWrite bool) bool {
 
 	var signingKey security.SigningKey
@@ -227,6 +239,8 @@ func (fs *FilerServer) maybeCheckJwtAuthorization(r *http.Request, isWrite bool)
 	}
 }
 
+// filerHealthzHandler 提供 /healthz 健康探针
+// 会写出版本信息以及最近一次与 master 通信的时间戳
 func (fs *FilerServer) filerHealthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Server", "SeaweedFS "+version.VERSION)
 	if _, err := fs.filer.Store.FindEntry(context.Background(), filer.TopicsDir); err != nil && err != filer_pb.ErrNotFound {

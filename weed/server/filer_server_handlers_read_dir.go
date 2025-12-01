@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_read_dir.go 实现 Web UI 和 API 的目录列举逻辑
+// 支持分页、名称过滤以及 JSON 或 HTML 两种返回形式。
 package weed_server
 
 import (
@@ -13,10 +15,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// listDirectoryHandler lists directories and folders under a directory
-// files are sorted by name and paginated via "lastFileName" and "limit".
-// sub directories are listed on the first page, when "lastFileName"
-// is empty.
+// listDirectoryHandler 负责列出指定目录下的子目录与文件
+// 默认按名称排序，并通过 lastFileName+limit 参数实现分页
+// 当 lastFileName 为空时，首先返回子目录，之后才列出文件记录
 func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if fs.option.ExposeDirectoryData == false {

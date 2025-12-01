@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_grpc_server.go 提供 Filer gRPC API 的核心实现
+// 负责目录项 CRUD、卷信息查询、分配文件上传位置等功能，所有逻辑均保持与上游一致。
 package weed_server
 
 import (
@@ -19,6 +21,13 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
+// LookupDirectoryEntry 根据目录和文件名查询单个目录项
+// 参数:
+//   - ctx: 请求上下文，承载链路日志信息
+//   - req: gRPC 请求，内含 Directory/Name
+// 返回:
+//   - LookupDirectoryEntryResponse: 命中时带回 Filer Entry
+//   - error: 找不到返回 filer_pb.ErrNotFound，发生其他异常时返回错误详情
 func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 
 	glog.V(4).InfofCtx(ctx, "LookupDirectoryEntry %s", filepath.Join(req.Directory, req.Name))
@@ -37,6 +46,14 @@ func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.L
 	}, nil
 }
 
+// ListEntries 通过流式 gRPC 接口列出目录下的文件
+// 参数:
+//   - req: 包含目录、分页游标、前缀过滤等信息
+//   - stream: Server 端流，用于逐条发送 filer_pb.ListEntriesResponse
+// 返回:
+//   - error: 发送流失败或底层 Store 异常会返回错误，其余情况返回 nil
+// 说明:
+//   - 函数会按分页窗口逐段列举，直到达到 limit 或目录被遍历完毕
 func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream filer_pb.SeaweedFiler_ListEntriesServer) (err error) {
 
 	glog.V(4).Infof("ListEntries %v", req)
@@ -88,6 +105,13 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 	return nil
 }
 
+// LookupVolume 根据卷 ID 列表查询 Volume Server 列表
+// 参数:
+//   - ctx: 上下文用于透传 trace 和超时
+//   - req: 请求中包含待查询的 VolumeIds
+// 返回:
+//   - LookupVolumeResponse: 以 map 形式返回卷与位置的映射
+//   - error: 查询 master 或缓存失败时返回错误，但仍可能包含部分结果
 func (fs *FilerServer) LookupVolume(ctx context.Context, req *filer_pb.LookupVolumeRequest) (*filer_pb.LookupVolumeResponse, error) {
 
 	resp := &filer_pb.LookupVolumeResponse{
@@ -108,6 +132,8 @@ func (fs *FilerServer) LookupVolume(ctx context.Context, req *filer_pb.LookupVol
 	return resp, err
 }
 
+// wdclientLocationsToPb 将 wdclient.Location 转为 gRPC Proto 定义
+// 主要用于在 LookupVolume 等接口中复用 master 缓存结果
 func wdclientLocationsToPb(locations []wdclient.Location) []*filer_pb.Location {
 	locs := make([]*filer_pb.Location, 0, len(locations))
 	for _, loc := range locations {
@@ -121,6 +147,8 @@ func wdclientLocationsToPb(locations []wdclient.Location) []*filer_pb.Location {
 	return locs
 }
 
+// lookupFileId 根据 fileId 查找其所在的 Volume 地址列表
+// 这是 FilerServer 内部工具函数，供 chunk 清理和 manifest 处理复用
 func (fs *FilerServer) lookupFileId(ctx context.Context, fileId string) (targetUrls []string, err error) {
 	fid, err := needle.ParseFileIdFromString(fileId)
 	if err != nil {
@@ -136,6 +164,12 @@ func (fs *FilerServer) lookupFileId(ctx context.Context, fileId string) (targetU
 	return
 }
 
+// CreateEntry 在指定目录下创建新的元数据记录
+// 步骤:
+//   1. 调用 cleanupChunks 清理旧块并生成最终 chunk 列表
+//   2. 根据路径探测存储策略（TTL、副本等）
+//   3. 将 proto Entry 转换为内部 Entry 并写入 filer store
+//   4. 成功后异步删除垃圾块
 func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntryRequest) (resp *filer_pb.CreateEntryResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "CreateEntry %v/%v", req.Directory, req.Entry.Name)
@@ -167,6 +201,8 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	return
 }
 
+// UpdateEntry 用于替换现有目录项的属性与 Chunk 信息
+// 会在更新前读取旧 Entry，计算差异并在成功后触发通知事件
 func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 
 	glog.V(4).InfofCtx(ctx, "UpdateEntry %v", req)
@@ -201,6 +237,8 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	return &filer_pb.UpdateEntryResponse{}, err
 }
 
+// cleanupChunks 对比旧新 chunk 列表，返回需要保留的 chunks 与待删除的垃圾块
+// 额外会处理 manifest chunk、追加 chunk 以及按路径推导存储选项
 func (fs *FilerServer) cleanupChunks(ctx context.Context, fullpath string, existingEntry *filer.Entry, newEntry *filer_pb.Entry) (chunks, garbage []*filer_pb.FileChunk, err error) {
 
 	// remove old chunks if not included in the new ones
@@ -239,6 +277,11 @@ func (fs *FilerServer) cleanupChunks(ctx context.Context, fullpath string, exist
 	return
 }
 
+// AppendToEntry 将追加的 chunk 列表附加到指定 Entry 后面
+// 在并发环境下通过集群分布式锁保证 offset 计算的一致性
+// 返回:
+//   - AppendToEntryResponse: 当前版本只携带错误信息
+//   - error: 写入 filer store 失败或锁失败时返回
 func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendToEntryRequest) (*filer_pb.AppendToEntryResponse, error) {
 
 	glog.V(4).InfofCtx(ctx, "AppendToEntry %v", req)
@@ -287,6 +330,8 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 	return &filer_pb.AppendToEntryResponse{}, err
 }
 
+// DeleteEntry 删除目录项及其数据，支持递归与条件删除等选项
+// 参数中的 IsDeleteData 决定是否同步删除底层数据块
 func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntryRequest) (resp *filer_pb.DeleteEntryResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "DeleteEntry %v", req)
@@ -299,6 +344,8 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 	return resp, nil
 }
 
+// AssignVolume 为客户端分配可写的文件 ID 及其 Volume 位置
+// 会根据路径策略自动补齐副本、TTL、数据中心等约束，并调用 master.Assign
 func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVolumeRequest) (resp *filer_pb.AssignVolumeResponse, err error) {
 
 	if req.DiskType == "" {
@@ -337,6 +384,8 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 	}, nil
 }
 
+// CollectionList 查询 Master，返回当前存在的所有 Collection 名称
+// 支持普通卷与纠删码卷通过请求参数进行过滤
 func (fs *FilerServer) CollectionList(ctx context.Context, req *filer_pb.CollectionListRequest) (resp *filer_pb.CollectionListResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "CollectionList %v", req)
@@ -359,6 +408,8 @@ func (fs *FilerServer) CollectionList(ctx context.Context, req *filer_pb.Collect
 	return
 }
 
+// DeleteCollection 调用 Filer 的 DoDeleteCollection 删除整套卷集合
+// 注意: 该操作属于危险操作，调用方需自行闭环授权
 func (fs *FilerServer) DeleteCollection(ctx context.Context, req *filer_pb.DeleteCollectionRequest) (resp *filer_pb.DeleteCollectionResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "DeleteCollection %v", req)

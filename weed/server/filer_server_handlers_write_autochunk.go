@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_write_autochunk.go 实现自动分片上传逻辑
+// 涵盖多种 HTTP 动作（POST/PUT）、WORM 权限校验以及元数据持久化。
 package weed_server
 
 import (
@@ -25,9 +27,14 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/constants"
 )
 
+// autoChunk 根据请求内容自动决定切片大小并分发到 POST/PUT 处理函数
+// 参数:
+//   - ctx: 请求上下文
+//   - contentLength: HTTP Header 中的 Content-Length，可为 -1
+//   - so: 存储策略，控制副本/TTL 等
 func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *http.Request, contentLength int64, so *operation.StorageOption) {
 
-	// autoChunking can be set at the command-line level or as a query param. Query param overrides command-line
+	// chunk 大小既可以通过命令行设置，也可以用 query 覆盖
 	query := r.URL.Query()
 
 	parsedMaxMB, _ := strconv.ParseInt(query.Get("maxMB"), 10, 32)
@@ -73,6 +80,8 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 	}
 }
 
+// doPostAutoChunk 处理 multipart/form-data 上传
+// 会遍历各 form part，分别写入目录或文件数据，返回写入结果与 MD5
 func (fs *FilerServer) doPostAutoChunk(ctx context.Context, w http.ResponseWriter, r *http.Request, chunkSize int32, contentLength int64, so *operation.StorageOption) (filerResult *FilerPostResult, md5bytes []byte, replyerr error) {
 	multipartReader, multipartReaderErr := r.MultipartReader()
 	if multipartReaderErr != nil {
@@ -125,6 +134,8 @@ func (fs *FilerServer) doPostAutoChunk(ctx context.Context, w http.ResponseWrite
 	return
 }
 
+// doPutAutoChunk 处理单个对象的 PUT 上传
+// 自动支持追加/覆盖、目录创建以及内容长度校验
 func (fs *FilerServer) doPutAutoChunk(ctx context.Context, w http.ResponseWriter, r *http.Request, chunkSize int32, contentLength int64, so *operation.StorageOption) (filerResult *FilerPostResult, md5bytes []byte, replyerr error) {
 
 	fileName := path.Base(r.URL.Path)
@@ -157,31 +168,41 @@ func (fs *FilerServer) doPutAutoChunk(ctx context.Context, w http.ResponseWriter
 	return
 }
 
+// isAppend 判断请求是否需采用追加模式
+// 依据 query 参数 append=true 或 header X-Seaweed-Append
 func isAppend(r *http.Request) bool {
 	return r.URL.Query().Get("op") == "append"
 }
 
+// skipCheckParentDirEntry 判断是否跳过父目录存在性检查
+// S3 直写对象时可以携带 skipCheckParent=true 来避免额外查询
 func skipCheckParentDirEntry(r *http.Request) bool {
 	return r.URL.Query().Get("skipCheckParentDir") == "true"
 }
 
+// isS3Request 用于快速判定当前请求是否来自 S3 协议栈
+// 依据特定 Header（如 Authorization/AWS v4）进行判定
 func isS3Request(r *http.Request) bool {
 	return r.Header.Get(s3_constants.AmzAuthType) != "" || r.Header.Get("X-Amz-Date") != ""
 }
 
+// checkPermissions 校验访问者是否具有写入/修改指定路径的权限
+// 主动检查 WORM 模式、S3 特殊限制等条件
 func (fs *FilerServer) checkPermissions(ctx context.Context, r *http.Request, fileName string) error {
 	fullPath := fs.fixFilePath(ctx, r, fileName)
 	enforced, err := fs.wormEnforcedForEntry(ctx, fullPath)
 	if err != nil {
 		return err
 	} else if enforced {
-		// you cannot change a worm file
+		// WORM 文件禁止修改或删除
 		return errors.New(constants.ErrMsgOperationNotPermitted)
 	}
 
 	return nil
 }
 
+// wormEnforcedForEntry 判断路径是否启用了 WORM（Write Once Read Many）策略
+// 返回 true 表示禁止覆盖/删除
 func (fs *FilerServer) wormEnforcedForEntry(ctx context.Context, fullPath string) (bool, error) {
 	rule := fs.filer.FilerConf.MatchStorageRule(fullPath)
 	if !rule.Worm {
@@ -197,19 +218,19 @@ func (fs *FilerServer) wormEnforcedForEntry(ctx context.Context, fullPath string
 		return false, err
 	}
 
-	// worm is not enforced
+	// 尚未真正启用 WORM（时间戳为 0）
 	if entry.WORMEnforcedAtTsNs == 0 {
 		return false, nil
 	}
 
-	// worm will never expire
+	// WORM 永久生效，不会过期
 	if rule.WormRetentionTimeSeconds == 0 {
 		return true, nil
 	}
 
 	enforcedAt := time.Unix(0, entry.WORMEnforcedAtTsNs)
 
-	// worm is expired
+	// WORM 已经过期，允许写入
 	if time.Now().Sub(enforcedAt).Seconds() >= float64(rule.WormRetentionTimeSeconds) {
 		return false, nil
 	}
@@ -217,8 +238,9 @@ func (fs *FilerServer) wormEnforcedForEntry(ctx context.Context, fullPath string
 	return true, nil
 }
 
+// fixFilePath 统一处理路径规范化，包括去重 //、处理 ..、补充 multipart 中的覆盖路径等
 func (fs *FilerServer) fixFilePath(ctx context.Context, r *http.Request, fileName string) string {
-	// fix the path
+	// 修正 path，确保目录和文件名组合正确
 	fullPath := r.URL.Path
 	if strings.HasSuffix(fullPath, "/") {
 		if fileName != "" {
@@ -237,9 +259,11 @@ func (fs *FilerServer) fixFilePath(ctx context.Context, r *http.Request, fileNam
 	return fullPath
 }
 
+// saveMetaData 构建并写入 Filer Entry 元数据
+// 包括用户自定义 header、ETag、chunk 位置等信息
 func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileName string, contentType string, so *operation.StorageOption, md5bytes []byte, fileChunks []*filer_pb.FileChunk, chunkOffset int64, content []byte) (filerResult *FilerPostResult, replyerr error) {
 
-	// detect file mode
+	// 检查请求头中是否携带文件权限信息
 	modeStr := r.URL.Query().Get("mode")
 	if modeStr == "" {
 		modeStr = "0660"
@@ -250,7 +274,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		mode = 0660
 	}
 
-	// fix the path
+	// 再次规范化路径，兼容 multipart 中的覆盖行为
 	path := fs.fixFilePath(ctx, r, fileName)
 
 	var entry *filer.Entry
@@ -259,7 +283,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 
 	isAppend := isAppend(r)
 	isOffsetWrite := len(fileChunks) > 0 && fileChunks[0].Offset > 0
-	// when it is an append
+	// 追加模式需要保留旧 chunk 并在末尾拼接
 	if isAppend || isOffsetWrite {
 		existingEntry, findErr := fs.filer.FindEntry(ctx, util.FullPath(path))
 		if findErr != nil && findErr != filer_pb.ErrNotFound {
@@ -270,7 +294,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	if entry != nil {
 		entry.Mtime = time.Now()
 		entry.Md5 = nil
-		// adjust chunk offsets
+		// 修正 chunk offset，保证连续
 		if isAppend {
 			for _, chunk := range fileChunks {
 				chunk.Offset += int64(entry.FileSize)
@@ -279,7 +303,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		}
 		newChunks = append(entry.GetChunks(), fileChunks...)
 
-		// TODO
+		// TODO: 可考虑在这里做更多冲突检测
 		if len(entry.Content) > 0 {
 			replyerr = fmt.Errorf("append to small file is not supported yet")
 			return
@@ -305,14 +329,14 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		}
 	}
 
-	// maybe concatenate small chunks into one whole chunk
+	// 若用户开启自动合并，小文件可拼成大 chunk
 	mergedChunks, replyerr = fs.maybeMergeChunks(ctx, so, newChunks)
 	if replyerr != nil {
 		glog.V(0).InfofCtx(ctx, "merge chunks %s: %v", r.RequestURI, replyerr)
 		mergedChunks = newChunks
 	}
 
-	// maybe compact entry chunks
+	// 根据策略压缩 Entry 的 chunk 列表
 	mergedChunks, replyerr = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), mergedChunks)
 	if replyerr != nil {
 		glog.V(0).InfofCtx(ctx, "manifestize %s: %v", r.RequestURI, replyerr)
@@ -335,7 +359,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		if len(v) > 0 && len(v[0]) > 0 {
 			if strings.HasPrefix(k, needle.PairNamePrefix) || k == "Cache-Control" || k == "Expires" || k == "Content-Disposition" {
 				entry.Extended[k] = []byte(v[0])
-				// Log version ID header specifically for debugging
+				// 记录版本号，便于调试
 				if k == "Seaweed-X-Amz-Version-Id" {
 					glog.V(0).Infof("filer: storing version ID header in Extended: %s=%s for path=%s", k, v[0], path)
 				}
@@ -346,9 +370,9 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		}
 	}
 
-	// Process SSE metadata headers sent by S3 API and store in entry extended metadata
+	// 解析 S3 发送的 SSE 头部，并写入扩展元数据
 	if sseIVHeader := r.Header.Get(s3_constants.SeaweedFSSSEIVHeader); sseIVHeader != "" {
-		// Decode base64-encoded IV and store in metadata
+		// 解码 IV 后写入 metadata
 		if ivData, err := base64.StdEncoding.DecodeString(sseIVHeader); err == nil {
 			entry.Extended[s3_constants.SeaweedFSSSEIV] = ivData
 			glog.V(4).Infof("Stored SSE-C IV metadata for %s", entry.FullPath)
@@ -357,7 +381,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		}
 	}
 
-	// Store SSE-C algorithm and key MD5 for proper S3 API response headers
+	// 保存 SSE-C 算法与 Key MD5，便于响应头回写
 	if sseAlgorithm := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerAlgorithm); sseAlgorithm != "" {
 		entry.Extended[s3_constants.AmzServerSideEncryptionCustomerAlgorithm] = []byte(sseAlgorithm)
 		glog.V(4).Infof("Stored SSE-C algorithm metadata for %s", entry.FullPath)
@@ -368,7 +392,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	}
 
 	if sseKMSHeader := r.Header.Get(s3_constants.SeaweedFSSSEKMSKeyHeader); sseKMSHeader != "" {
-		// Decode base64-encoded KMS metadata and store
+		// 解码 SSE-KMS 元数据
 		if kmsData, err := base64.StdEncoding.DecodeString(sseKMSHeader); err == nil {
 			entry.Extended[s3_constants.SeaweedFSSSEKMSKey] = kmsData
 			glog.V(4).Infof("Stored SSE-KMS metadata for %s", entry.FullPath)
@@ -378,7 +402,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	}
 
 	if sseS3Header := r.Header.Get(s3_constants.SeaweedFSSSES3Key); sseS3Header != "" {
-		// Decode base64-encoded S3 metadata and store
+		// 解码 SSE-S3 元数据
 		if s3Data, err := base64.StdEncoding.DecodeString(sseS3Header); err == nil {
 			entry.Extended[s3_constants.SeaweedFSSSES3Key] = s3Data
 			glog.V(4).Infof("Stored SSE-S3 metadata for %s", entry.FullPath)
@@ -388,7 +412,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	}
 
 	dbErr := fs.filer.CreateEntry(ctx, entry, false, false, nil, skipCheckParentDirEntry(r), so.MaxFileNameLength)
-	// In test_bucket_listv2_delimiter_basic, the valid object key is the parent folder
+	// 某些 S3 测试场景中，object key 即父目录，需要特殊处理
 	if dbErr != nil && strings.HasSuffix(dbErr.Error(), " is a file") && isS3Request(r) {
 		dbErr = fs.filer.CreateEntry(ctx, entry, false, false, nil, true, so.MaxFileNameLength)
 	}
@@ -400,6 +424,8 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	return filerResult, replyerr
 }
 
+// saveAsChunk 返回一个闭包，用于在 autoChunk 期间将内存数据保存为 Volume chunk
+// 闭包内部负责调用 assignNewFileInfo 与实际上传逻辑
 func (fs *FilerServer) saveAsChunk(ctx context.Context, so *operation.StorageOption) filer.SaveDataAsChunkFunctionType {
 
 	return func(reader io.Reader, name string, offset int64, tsNs int64) (*filer_pb.FileChunk, error) {
@@ -407,7 +433,7 @@ func (fs *FilerServer) saveAsChunk(ctx context.Context, so *operation.StorageOpt
 		var uploadResult *operation.UploadResult
 
 		err := util.Retry("saveAsChunk", func() error {
-			// assign one file id for one chunk
+			// 每个 chunk 分配一个唯一 fid
 			assignedFileId, urlLocation, auth, assignErr := fs.assignNewFileInfo(ctx, so)
 			if assignErr != nil {
 				return assignErr
@@ -415,7 +441,7 @@ func (fs *FilerServer) saveAsChunk(ctx context.Context, so *operation.StorageOpt
 
 			fileId = assignedFileId
 
-			// upload the chunk to the volume server
+			// 上传 chunk 到 Volume
 			uploadOption := &operation.UploadOption{
 				UploadUrl:         urlLocation,
 				Filename:          name,
@@ -446,9 +472,11 @@ func (fs *FilerServer) saveAsChunk(ctx context.Context, so *operation.StorageOpt
 	}
 }
 
+// mkdir 处理创建目录的请求
+// 支持多级创建并复用 saveMetaData 写入目录属性
 func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http.Request, so *operation.StorageOption) (filerResult *FilerPostResult, replyerr error) {
 
-	// detect file mode
+	// 设置目录权限
 	modeStr := r.URL.Query().Get("mode")
 	if modeStr == "" {
 		modeStr = "0660"
@@ -459,7 +487,7 @@ func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http
 		mode = 0660
 	}
 
-	// fix the path
+	// 再次修正路径，确保目录尾部以 / 结尾
 	path := r.URL.Path
 	if strings.HasSuffix(path, "/") {
 		path = path[:len(path)-1]
@@ -496,6 +524,8 @@ func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http
 	return filerResult, replyerr
 }
 
+// SaveAmzMetaData 将请求头中以 Seaweed-/X-Amz-Meta- 开头的字段写入扩展属性
+// isReplace 控制是否覆盖旧值，existing 用于在更新时保留原始数据
 func SaveAmzMetaData(r *http.Request, existing map[string][]byte, isReplace bool) (metadata map[string][]byte) {
 
 	metadata = make(map[string][]byte)
@@ -514,14 +544,13 @@ func SaveAmzMetaData(r *http.Request, existing map[string][]byte, isReplace bool
 	}
 
 	if tags := r.Header.Get(s3_constants.AmzObjectTagging); tags != "" {
-		// Use url.ParseQuery for robust parsing and automatic URL decoding
+		// 使用 url.ParseQuery 解析并自动反解编码
 		parsedTags, err := url.ParseQuery(tags)
 		if err != nil {
 			glog.Errorf("Failed to parse S3 tags '%s': %v", tags, err)
 		} else {
 			for key, values := range parsedTags {
-				// According to S3 spec, if a key is provided multiple times, the last value is used.
-				// A tag value can be an empty string but not nil.
+				// S3 规范要求相同 key 取最后一个值；值可以为空字符串但不能为 nil
 				value := ""
 				if len(values) > 0 {
 					value = values[len(values)-1]
@@ -539,12 +568,12 @@ func SaveAmzMetaData(r *http.Request, existing map[string][]byte, isReplace bool
 		}
 	}
 
-	// Handle SSE-C headers
+	// 处理 SSE-C 相关请求头
 	if algorithm := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerAlgorithm); algorithm != "" {
 		metadata[s3_constants.AmzServerSideEncryptionCustomerAlgorithm] = []byte(algorithm)
 	}
 	if keyMD5 := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerKeyMD5); keyMD5 != "" {
-		// Store as-is; SSE-C MD5 is base64 and case-sensitive
+		// 直接存储 SSE-C MD5，保持大小写
 		metadata[s3_constants.AmzServerSideEncryptionCustomerKeyMD5] = []byte(keyMD5)
 	}
 

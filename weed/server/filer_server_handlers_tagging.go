@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_tagging.go 提供对象标签（Seaweed- 前缀）管理接口
+// 包含添加/替换以及删除扩展属性的 HTTP 处理逻辑。
 package weed_server
 
 import (
@@ -9,8 +11,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// add or replace one file Seaweed- prefixed attributes
-// curl -X PUT -H "Seaweed-Name1: value1" http://localhost:8888/path/to/a/file?tagging
+// PutTaggingHandler 支持通过 HTTP PUT 添加或替换以 Seaweed- 开头的扩展属性
+// 示例:
+//   curl -X PUT -H "Seaweed-Name1: value1" http://localhost:8888/path/to/file?tagging
 func (fs *FilerServer) PutTaggingHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
@@ -52,8 +55,10 @@ func (fs *FilerServer) PutTaggingHandler(w http.ResponseWriter, r *http.Request)
 	return
 }
 
-// remove all Seaweed- prefixed attributes
-// curl -X DELETE http://localhost:8888/path/to/a/file?tagging
+// DeleteTaggingHandler 删除 Seaweed- 前缀的扩展属性
+// 如果 URL 参数 tagging=tag1,tag2 存在，则删除指定标签，否则删除全部
+// 示例:
+//   curl -X DELETE http://localhost:8888/path/to/file?tagging
 func (fs *FilerServer) DeleteTaggingHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()

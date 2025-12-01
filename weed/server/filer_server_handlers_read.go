@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_read.go 提供 GET/HEAD 等读取路径的实现
+// 负责处理目录展示、Range 读取、预条件校验以及与 Volume 的协同。
 package weed_server
 
 import (
@@ -25,13 +27,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// Validates the preconditions. Returns true if GET/HEAD operation should not proceed.
-// Preconditions supported are:
-//
-//	If-Modified-Since
-//	If-Unmodified-Since
-//	If-Match
-//	If-None-Match
+// checkPreconditions 检查 HTTP 预条件头部，必要时短路请求
+// 支持的条件包括 If-Modified-Since、If-Unmodified-Since、If-Match、If-None-Match
+// 返回 true 表示已向客户端写入响应并结束处理
 func checkPreconditions(w http.ResponseWriter, r *http.Request, entry *filer.Entry) bool {
 
 	etag := filer.ETagEntry(entry)
@@ -85,6 +83,8 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, entry *filer.Ent
 	return false
 }
 
+// GetOrHeadHandler 统一处理 GET/HEAD 请求
+// 逻辑覆盖目录列表、元数据查询、Range 下载以及清单解析
 func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	path := r.URL.Path
@@ -312,6 +312,8 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// maybeGetVolumeReadJwtAuthorizationToken 生成只读 Volume 访问令牌
+// 用于 streaming 读取底层 chunk 时附带到 HTTP 请求头中
 func (fs *FilerServer) maybeGetVolumeReadJwtAuthorizationToken(fileId string) string {
 	return string(security.GenJwtForVolumeServer(fs.volumeGuard.ReadSigningKey, fs.volumeGuard.ReadExpiresAfterSec, fileId))
 }

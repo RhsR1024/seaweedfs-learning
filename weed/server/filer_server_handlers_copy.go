@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_copy.go 实现 HTTP 拷贝 (cp) 操作
+// 负责在不同路径之间复制元数据及数据块，确保与 Volume 交互保持原行为。
 package weed_server
 
 import (
@@ -19,6 +21,15 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
+// copy 实现 /?cp.from=xxx 的同步拷贝逻辑
+// 参数:
+//   - ctx: 每个请求的上下文，用于日志与取消
+//   - w/r: HTTP 读写器
+//   - so: 针对本次复制推导出的 StorageOption（控制副本、TTL 等）
+// 行为:
+//   - 校验源/目标路径合法性
+//   - 拉取源 Entry 并判断是否允许复制
+//   - 调用 copyEntry 执行实际复制
 func (fs *FilerServer) copy(ctx context.Context, w http.ResponseWriter, r *http.Request, so *operation.StorageOption) {
 	src := r.URL.Query().Get("cp.from")
 	dst := r.URL.Path
@@ -116,6 +127,8 @@ func (fs *FilerServer) copy(ctx context.Context, w http.ResponseWriter, r *http.
 }
 
 // copyEntry creates a new entry with copied content and chunks
+// copyEntry 负责将元数据写入目标路径并复制底层 chunk
+// 返回复制完成后的 Entry，供上层写入 filer store
 func (fs *FilerServer) copyEntry(ctx context.Context, srcEntry *filer.Entry, dstPath util.FullPath, so *operation.StorageOption) (*filer.Entry, error) {
 	// Create the base entry structure
 	// Note: For hard links, we copy the actual content but NOT the HardLinkId/HardLinkCounter
@@ -202,6 +215,8 @@ func (fs *FilerServer) copyEntry(ctx context.Context, srcEntry *filer.Entry, dst
 }
 
 // copyChunks creates new chunks by copying data from source chunks using parallel streaming approach
+// copyChunks 对每个 chunk 执行 stream copy，并保持和源 chunk 相同的顺序/偏移
+// 当数据量较大时会自动进行 manifest 化以控制 chunk 数量
 func (fs *FilerServer) copyChunks(ctx context.Context, srcChunks []*filer_pb.FileChunk, so *operation.StorageOption, client *http.Client) ([]*filer_pb.FileChunk, error) {
 	if len(srcChunks) == 0 {
 		return nil, nil
@@ -275,6 +290,8 @@ func (fs *FilerServer) copyChunks(ctx context.Context, srcChunks []*filer_pb.Fil
 }
 
 // copyChunksWithManifest handles copying chunks that include manifest chunks
+// copyChunksWithManifest 在复制前拆分 manifest chunk
+// 以避免直接对 manifest 做深拷贝导致引用脏数据
 func (fs *FilerServer) copyChunksWithManifest(ctx context.Context, srcChunks []*filer_pb.FileChunk, so *operation.StorageOption, client *http.Client) ([]*filer_pb.FileChunk, error) {
 	if len(srcChunks) == 0 {
 		return nil, nil
@@ -339,6 +356,8 @@ func (fs *FilerServer) copyChunksWithManifest(ctx context.Context, srcChunks []*
 }
 
 // createManifestChunk creates a new manifest chunk that references the provided data chunks
+// createManifestChunk 在需要时生成新的 manifest chunk
+// 会重用原 manifest chunk 的属性，同时重新构建真实数据块列表
 func (fs *FilerServer) createManifestChunk(ctx context.Context, dataChunks []*filer_pb.FileChunk, originalManifest *filer_pb.FileChunk, so *operation.StorageOption, client *http.Client) (*filer_pb.FileChunk, error) {
 	// Create the manifest data structure
 	filer_pb.BeforeEntrySerialization(dataChunks)
@@ -389,6 +408,8 @@ func (fs *FilerServer) createManifestChunk(ctx context.Context, dataChunks []*fi
 }
 
 // uploadData uploads data to a volume server
+// uploadData 将内存缓冲或流式 reader 上传至指定 Volume Server
+// 通过设置 JWT 与 Content-Length，保持与普通上传一致
 func (fs *FilerServer) uploadData(ctx context.Context, reader io.Reader, urlLocation, auth string, client *http.Client) error {
 	req, err := http.NewRequestWithContext(ctx, "PUT", urlLocation, reader)
 	if err != nil {
@@ -417,6 +438,8 @@ func (fs *FilerServer) uploadData(ctx context.Context, reader io.Reader, urlLoca
 }
 
 // batchLookupVolumeLocations performs a single batched lookup for all unique volume IDs in the chunks
+// batchLookupVolumeLocations 批量查询 chunk 所属卷的位置，减少与 master 的往返
+// 返回值以 VolumeId 为 key，包含多个 replica 地址
 func (fs *FilerServer) batchLookupVolumeLocations(ctx context.Context, chunks []*filer_pb.FileChunk) (map[uint32][]operation.Location, error) {
 	// Collect unique volume IDs and their string representations to avoid repeated conversions
 	volumeIdMap := make(map[uint32]string)
@@ -455,6 +478,8 @@ func (fs *FilerServer) batchLookupVolumeLocations(ctx context.Context, chunks []
 }
 
 // streamCopyChunk copies a chunk using streaming to minimize memory usage
+// streamCopyChunk 执行单个 chunk 的双向流式 copy（从源 Volume 拉取再推给目标）
+// 返回新的 chunk 元数据，包含复制后的 fileId 与偏移信息
 func (fs *FilerServer) streamCopyChunk(ctx context.Context, srcChunk *filer_pb.FileChunk, so *operation.StorageOption, client *http.Client, locations []operation.Location) (*filer_pb.FileChunk, error) {
 	// Assign a new file ID for destination
 	fileId, urlLocation, auth, err := fs.assignNewFileInfo(ctx, so)
@@ -495,6 +520,8 @@ func (fs *FilerServer) streamCopyChunk(ctx context.Context, srcChunk *filer_pb.F
 }
 
 // performStreamCopy performs the actual streaming copy from source URL to destination URL
+// performStreamCopy 通过 HTTP 流复制数据
+// 会在目标端设置 Content-Length 并校验复制完成前后的数据量是否一致
 func (fs *FilerServer) performStreamCopy(ctx context.Context, srcUrl, dstUrl, auth string, expectedSize uint64, client *http.Client) error {
 	// Create HTTP request to read from source
 	req, err := http.NewRequestWithContext(ctx, "GET", srcUrl, nil)

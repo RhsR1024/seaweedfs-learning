@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_grpc_server_admin.go 提供 filer 侧管理类 gRPC 接口
+// 主要用于统计查询、延迟测试以及配置获取。
 package weed_server
 
 import (
@@ -14,6 +16,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 )
 
+// Statistics 调用 master 端的统计接口，返回容量/数量等指标
+// 参数可指定副本策略、集合、TTL、磁盘类型以便过滤
 func (fs *FilerServer) Statistics(ctx context.Context, req *filer_pb.StatisticsRequest) (resp *filer_pb.StatisticsResponse, err error) {
 
 	var output *master_pb.StatisticsResponse
@@ -44,6 +48,8 @@ func (fs *FilerServer) Statistics(ctx context.Context, req *filer_pb.StatisticsR
 	}, nil
 }
 
+// Ping 支持在 Filer、Volume、Master 之间执行延迟探测
+// 根据 TargetType 自动选择客户端并记录本地/远端时间戳
 func (fs *FilerServer) Ping(ctx context.Context, req *filer_pb.PingRequest) (resp *filer_pb.PingResponse, pingErr error) {
 	resp = &filer_pb.PingResponse{
 		StartTimeNs: time.Now().UnixNano(),
@@ -82,6 +88,8 @@ func (fs *FilerServer) Ping(ctx context.Context, req *filer_pb.PingRequest) (res
 	return
 }
 
+// GetFilerConfiguration 返回当前 Filer 实例的主要配置项
+// 包括 master 列表、默认副本策略、自定义 HTTP 行为等
 func (fs *FilerServer) GetFilerConfiguration(ctx context.Context, req *filer_pb.GetFilerConfigurationRequest) (resp *filer_pb.GetFilerConfigurationResponse, err error) {
 
 	t := &filer_pb.GetFilerConfigurationResponse{

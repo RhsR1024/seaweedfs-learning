@@ -1,3 +1,5 @@
+// Package weed_server 提供 Master、Volume、Filer 等 HTTP/gRPC 服务的通用辅助函数
+// 本文件包含 HTTP 工具、静态资源挂载、Range 处理、请求统计等基础能力。
 package weed_server
 
 import (

@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_write_cipher.go 处理客户端上传请求的服务端加密流程
+// 其接口由 encrypt 函数对接 HTTP Handler 使用。
 package weed_server
 
 import (
@@ -16,7 +18,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// handling single chunk POST or PUT upload
+// encrypt 负责在 POST/PUT 单块上传时执行服务端加密写入
+// 流程: 分配 fid -> 解析上传内容 -> 调用 Volume 进行加密上传 -> 保存元数据
 func (fs *FilerServer) encrypt(ctx context.Context, w http.ResponseWriter, r *http.Request, so *operation.StorageOption) (filerResult *FilerPostResult, err error) {
 
 	fileId, urlLocation, auth, err := fs.assignNewFileInfo(ctx, so)

@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_write_upload.go 提供上传过程中与 Volume Server 交互的细节实现
+// 包括请求读流拆分、chunk 上传、服务端加密以及小文件内联逻辑。
 package weed_server
 
 import (
@@ -26,12 +28,15 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
+// bufPool 复用 bytes.Buffer，避免在大文件上传时重复分配内存
 var bufPool = sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)
 	},
 }
 
+// uploadRequestToChunks 解析 HTTP 请求并将 payload 拆分为 chunk
+// 同时支持 offset 指定起始位置、append 模式等高级特性
 func (fs *FilerServer) uploadRequestToChunks(ctx context.Context, w http.ResponseWriter, r *http.Request, reader io.Reader, chunkSize int32, fileName, contentType string, contentLength int64, so *operation.StorageOption) (fileChunks []*filer_pb.FileChunk, md5Hash hash.Hash, chunkOffset int64, uploadErr error, smallContent []byte) {
 	query := r.URL.Query()
 
@@ -53,6 +58,8 @@ func (fs *FilerServer) uploadRequestToChunks(ctx context.Context, w http.Respons
 	return fs.uploadReaderToChunks(ctx, r, reader, chunkOffset, chunkSize, fileName, contentType, isAppend, so)
 }
 
+// uploadReaderToChunks 实际执行读取与并发上传
+// 采用带缓冲池的 goroutine 并发模型，将大文件拆分后同步或异步上传
 func (fs *FilerServer) uploadReaderToChunks(ctx context.Context, r *http.Request, reader io.Reader, startOffset int64, chunkSize int32, fileName, contentType string, isAppend bool, so *operation.StorageOption) (fileChunks []*filer_pb.FileChunk, md5Hash hash.Hash, chunkOffset int64, uploadErr error, smallContent []byte) {
 
 	md5Hash = md5.New()
@@ -66,11 +73,11 @@ func (fs *FilerServer) uploadReaderToChunks(ctx context.Context, r *http.Request
 	var uploadErrLock sync.Mutex
 	for {
 
-		// need to throttle used byte buffer
+		// 限制同时占用的缓冲区数量，避免占满内存
 		bytesBufferLimitChan <- struct{}{}
 
-		// As long as there is an error in the upload of one chunk, it can be terminated early
-		// uploadErr may be modified in other go routines, lock is needed to avoid race condition
+		// 任一 chunk 上传失败即可提前结束
+		// uploadErr 可能被多个协程修改，因此必须加锁
 		uploadErrLock.Lock()
 		if uploadErr != nil {
 			<-bytesBufferLimitChan
@@ -87,7 +94,7 @@ func (fs *FilerServer) uploadReaderToChunks(ctx context.Context, r *http.Request
 
 		dataSize, err := bytesBuffer.ReadFrom(limitedReader)
 
-		// data, err := io.ReadAll(limitedReader)
+		// data, err := io.ReadAll(limitedReader) // 旧实现，保留以便排查
 		if err != nil || dataSize == 0 {
 			bufPool.Put(bytesBuffer)
 			<-bytesBufferLimitChan
@@ -141,10 +148,10 @@ func (fs *FilerServer) uploadReaderToChunks(ctx context.Context, r *http.Request
 			}
 		}(chunkOffset, bytesBuffer)
 
-		// reset variables for the next chunk
+		// 重置下一个 chunk 需要用到的偏移
 		chunkOffset = chunkOffset + dataSize
 
-		// if last chunk was not at full chunk size, but already exhausted the reader
+		// 如果最后一个 chunk 没有填满 chunkSize，说明已经读到末尾，直接退出
 		if dataSize < int64(chunkSize) {
 			break
 		}
@@ -166,6 +173,8 @@ func (fs *FilerServer) uploadReaderToChunks(ctx context.Context, r *http.Request
 	return fileChunks, md5Hash, chunkOffset, nil, smallContent
 }
 
+// doUpload 调用 operation.UploadResult 完成实际的 HTTP 上传
+// 返回上传结果与可能的内联内容（用于极小文件）
 func (fs *FilerServer) doUpload(ctx context.Context, urlLocation string, limitedReader io.Reader, fileName string, contentType string, pairMap map[string]string, auth security.EncodedJwt) (*operation.UploadResult, error, []byte) {
 
 	stats.FilerHandlerCounter.WithLabelValues(stats.ChunkUpload).Inc()
@@ -196,14 +205,17 @@ func (fs *FilerServer) doUpload(ctx context.Context, urlLocation string, limited
 	return uploadResult, err, data
 }
 
+// dataToChunk 直接将内存数据写入 Volume，产生新的 chunk 元信息
+// 常用于 append 或内联写入场景
 func (fs *FilerServer) dataToChunk(ctx context.Context, fileName, contentType string, data []byte, chunkOffset int64, so *operation.StorageOption) ([]*filer_pb.FileChunk, error) {
 	return fs.dataToChunkWithSSE(ctx, nil, fileName, contentType, data, chunkOffset, so)
 }
 
+// dataToChunkWithSSE 在 dataToChunk 基础上，增加对 SSE-C 请求头的解析和透传
 func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, fileName, contentType string, data []byte, chunkOffset int64, so *operation.StorageOption) ([]*filer_pb.FileChunk, error) {
 	dataReader := util.NewBytesReader(data)
 
-	// retry to assign a different file id
+	// 如果分配文件 ID 失败，重试以获取不同的 file id
 	var fileId, urlLocation string
 	var auth security.EncodedJwt
 	var uploadErr error
@@ -211,14 +223,14 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 	var failedFileChunks []*filer_pb.FileChunk
 
 	err := util.Retry("filerDataToChunk", func() error {
-		// assign one file id for one chunk
+		// 每个 chunk 都单独分配 fid，避免并发覆盖
 		fileId, urlLocation, auth, uploadErr = fs.assignNewFileInfo(ctx, so)
 		if uploadErr != nil {
 			glog.V(4).InfofCtx(ctx, "retry later due to assign error: %v", uploadErr)
 			stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssignRetry).Inc()
 			return uploadErr
 		}
-		// upload the chunk to the volume server
+		// 将 chunk 上传至对应的 Volume Server
 		uploadResult, uploadErr, _ = fs.doUpload(ctx, urlLocation, dataReader, fileName, contentType, nil, auth)
 		if uploadErr != nil {
 			glog.V(4).InfofCtx(ctx, "retry later due to upload error: %v", uploadErr)
@@ -239,18 +251,18 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 		return failedFileChunks, err
 	}
 
-	// if last chunk exhausted the reader exactly at the border
+	// 如果最后一个 chunk 恰好读到边界，此时 chunkOffset 需要回退
 	if uploadResult.Size == 0 {
 		return nil, nil
 	}
 
-	// Extract SSE metadata from request headers if available
+	// 从请求头中提取 SSE 相关元数据（如算法、Key ID 等）
 	var sseType filer_pb.SSEType = filer_pb.SSEType_NONE
 	var sseMetadata []byte
 
 	if r != nil {
 
-		// Check for SSE-KMS
+		// 处理 SSE-KMS: 直接复用请求头信息
 		sseKMSHeaderValue := r.Header.Get(s3_constants.SeaweedFSSSEKMSKeyHeader)
 		if sseKMSHeaderValue != "" {
 			sseType = filer_pb.SSEType_SSE_KMS
@@ -261,17 +273,17 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 				glog.V(1).InfofCtx(ctx, "Failed to decode SSE-KMS metadata for chunk %s: %v", fileId, err)
 			}
 		} else if r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerAlgorithm) != "" {
-			// SSE-C: Create per-chunk metadata for unified handling
+			// SSE-C: 为每个 chunk 构造独立元数据，方便统一处理
 			sseType = filer_pb.SSEType_SSE_C
 
-			// Get SSE-C metadata from headers to create unified per-chunk metadata
+			// 从请求头拿到 SSE-C 的密钥、IV 等信息
 			sseIVHeader := r.Header.Get(s3_constants.SeaweedFSSSEIVHeader)
 			keyMD5Header := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerKeyMD5)
 
 			if sseIVHeader != "" && keyMD5Header != "" {
-				// Decode IV from header
+				// Base64 解码 IV
 				if ivData, err := base64.StdEncoding.DecodeString(sseIVHeader); err == nil {
-					// Create SSE-C metadata with chunk offset = chunkOffset for proper IV calculation
+					// SSE-C 的偏移必须与 chunkOffset 对齐，以便解密时生成正确 IV
 					ssecMetadataStruct := struct {
 						Algorithm  string `json:"algorithm"`
 						IV         string `json:"iv"`
@@ -295,15 +307,15 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 				glog.V(4).InfofCtx(ctx, "SSE-C chunk %s missing IV or KeyMD5 header", fileId)
 			}
 		} else if r.Header.Get(s3_constants.SeaweedFSSSES3Key) != "" {
-			// SSE-S3: Server-side encryption with server-managed keys
-			// Set the correct SSE type for SSE-S3 chunks to maintain proper tracking
+			// SSE-S3: 使用服务器托管密钥
+			// 将 chunk 类型标记为 SSE-S3，后续便于统计
 			sseType = filer_pb.SSEType_SSE_S3
 
-			// Get SSE-S3 metadata from headers
+			// 从请求头提取 SSE-S3 所需的元数据
 			sseS3Header := r.Header.Get(s3_constants.SeaweedFSSSES3Key)
 			if sseS3Header != "" {
 				if s3Data, err := base64.StdEncoding.DecodeString(sseS3Header); err == nil {
-					// For SSE-S3, store metadata at chunk level for consistency with SSE-KMS/SSE-C
+					// SSE-S3 也保持 chunk 级别的 metadata，以统一处理逻辑
 					glog.V(4).InfofCtx(ctx, "Storing SSE-S3 metadata for chunk %s at offset %d", fileId, chunkOffset)
 					sseMetadata = s3Data
 				} else {
@@ -313,7 +325,7 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 		}
 	}
 
-	// Create chunk with SSE metadata if available
+	// 如果存在 SSE 元数据，写入 chunk 结构中
 	var chunk *filer_pb.FileChunk
 	if sseType != filer_pb.SSEType_NONE {
 		chunk = uploadResult.ToPbFileChunkWithSSE(fileId, chunkOffset, time.Now().UnixNano(), sseType, sseMetadata)

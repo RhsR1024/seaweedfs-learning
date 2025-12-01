@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server.go 负责 Filer 服务本体的初始化、配置加载与生命周期管理
+// 包括 HTTP/gRPC 接入、存储后端选择以及与 Master 的心跳交互逻辑。
 package weed_server
 
 import (
@@ -54,6 +56,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/security"
 )
 
+// FilerOption 描述 Filer 进程的运行参数
+// 包含 master 自动发现、默认副本策略、HTTP 暴露开关、上传限制等配置项
+// 这些字段通常来自命令行或 YAML/Viper 配置文件
 type FilerOption struct {
 	Masters               *pb.ServerDiscovery
 	FilerGroup            string
@@ -79,6 +84,8 @@ type FilerOption struct {
 	ExposeDirectoryData   bool
 }
 
+// FilerServer 封装一个运行中的 Filer 节点
+// 除了 gRPC Service 实现本身，还维护了监听者列表、master metrics 订阅、令牌签名器等资源
 type FilerServer struct {
 	inFlightDataSize int64
 	listenersWaits   int64
@@ -106,6 +113,11 @@ type FilerServer struct {
 	knownListeners     map[int32]int32
 }
 
+// NewFilerServer 根据传入的 HTTP mux 与配置选项创建完整的 FilerServer
+// 核心步骤:
+//   1. 读取 JWT、CORS、目录曝光等配置形成运行选项
+//   2. 初始化 Filer、Guard、通知模块以及静态资源路由
+//   3. 建立与 Master 的连接并启动指标上报
 func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption) (fs *FilerServer, err error) {
 
 	v := util.GetViper()
@@ -224,6 +236,8 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	return fs, nil
 }
 
+// checkWithMaster 周期性地从 Master 拉取统计配置
+// 包括 metrics 地址、推送周期等，缺省值来自 Master 的配置信息
 func (fs *FilerServer) checkWithMaster() {
 
 	isConnected := false
@@ -247,6 +261,8 @@ func (fs *FilerServer) checkWithMaster() {
 	}
 }
 
+// Reload 实现 util/grace.Reloadable 接口，用于 HUP 信号触发的热更新
+// 当前实现仅记录日志并可在后续扩展动态配置刷新
 func (fs *FilerServer) Reload() {
 	glog.V(0).Infoln("Reload filer server...")
 

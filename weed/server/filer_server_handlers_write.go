@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_write.go 管理 Filer 写路径相关逻辑
+// 包括上传、移动、删除以及存储策略的推导。
 package weed_server
 
 import (
@@ -23,18 +25,24 @@ import (
 )
 
 var (
+	// OS_UID/OS_GID 缓存当前进程的用户/用户组，作为默认写入属性
 	OS_UID = uint32(os.Getuid())
 	OS_GID = uint32(os.Getgid())
 
+	// ErrReadOnly 表示当前路径由于 WORM/权限等原因被视为只读
 	ErrReadOnly = errors.New("read only")
 )
 
+// FilerPostResult 是 POST 上传接口的通用响应
+// Name 为文件名，Size 为写入成功的大小，Error 则用于返回失败原因
 type FilerPostResult struct {
 	Name  string `json:"name,omitempty"`
 	Size  int64  `json:"size,omitempty"`
 	Error string `json:"error,omitempty"`
 }
 
+// assignNewFileInfo 调用 master 分配一个可写的 fid 与上传地址
+// 同时根据 StorageOption 的 fsync、数据中心偏好等信息生成最终 URL
 func (fs *FilerServer) assignNewFileInfo(ctx context.Context, so *operation.StorageOption) (fileId, urlLocation string, auth security.EncodedJwt, err error) {
 
 	stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssign).Inc()
@@ -70,6 +78,8 @@ func (fs *FilerServer) assignNewFileInfo(ctx context.Context, so *operation.Stor
 	return
 }
 
+// PostHandler 处理所有写入入口（上传、移动、复制）
+// 会先解析 query，构造 StorageOption，再根据 mv.from/cp.from 判定操作类型
 func (fs *FilerServer) PostHandler(w http.ResponseWriter, r *http.Request, contentLength int64) {
 	ctx := r.Context()
 
@@ -127,6 +137,8 @@ func (fs *FilerServer) PostHandler(w http.ResponseWriter, r *http.Request, conte
 
 }
 
+// move 将 mv.from 指定的条目移动至目标路径
+// 内部通过 AtomicRenameEntry 保证跨目录移动的原子性
 func (fs *FilerServer) move(ctx context.Context, w http.ResponseWriter, r *http.Request, so *operation.StorageOption) {
 	src := r.URL.Query().Get("mv.from")
 	dst := r.URL.Path
@@ -209,6 +221,8 @@ func (fs *FilerServer) move(ctx context.Context, w http.ResponseWriter, r *http.
 // curl -X DELETE http://localhost:8888/path/to?recursive=true
 // curl -X DELETE http://localhost:8888/path/to?recursive=true&ignoreRecursiveError=true
 // curl -X DELETE http://localhost:8888/path/to?recursive=true&skipChunkDeletion=true
+// DeleteHandler 响应 DELETE 请求，支持递归删除、WORM 校验等功能
+// 参数来自 URL query，例如 recursive=true
 func (fs *FilerServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	isRecursive := r.FormValue("recursive") == "true"
 	if !isRecursive && fs.option.recursiveDelete {
@@ -243,6 +257,8 @@ func (fs *FilerServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// detectStorageOption 对外暴露的便捷函数，用于在 gRPC/HTTP 入口处推导存储策略
+// 其中 ttlSeconds 参数允许直接传入秒级 TTL，其他字段沿用 detectStorageOption0
 func (fs *FilerServer) detectStorageOption(ctx context.Context, requestURI, qCollection, qReplication string, ttlSeconds int32, diskType, dataCenter, rack, dataNode string) (*operation.StorageOption, error) {
 
 	rule := fs.filer.FilerConf.MatchStorageRule(requestURI)
@@ -283,6 +299,8 @@ func (fs *FilerServer) detectStorageOption(ctx context.Context, requestURI, qCol
 	}, nil
 }
 
+// detectStorageOption0 是真正的策略推导核心
+// 会综合考虑路径配置、查询参数、WORM 状态以及 saveInside 标志，最终返回 StorageOption
 func (fs *FilerServer) detectStorageOption0(ctx context.Context, requestURI, qCollection, qReplication string, qTtl string, diskType string, fsync string, dataCenter, rack, dataNode, saveInside string) (*operation.StorageOption, error) {
 
 	ttl, err := needle.ReadTTL(qTtl)

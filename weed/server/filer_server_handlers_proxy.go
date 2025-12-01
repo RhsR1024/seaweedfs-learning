@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_server_handlers_proxy.go 负责 Filer 对 Volume 的反向代理逻辑
+// 该文件确保 HTTP 请求能够透传到正确的 Volume Server 并注入符合要求的 JWT。
 package weed_server
 
 import (
@@ -12,6 +14,8 @@ import (
 	"net/http"
 )
 
+// maybeAddVolumeJwtAuthorization 为代理请求添加 Volume 级别的 JWT
+// 根据 isWrite 选择读写不同的签名密钥，确保 Volume 端严格鉴权
 func (fs *FilerServer) maybeAddVolumeJwtAuthorization(r *http.Request, fileId string, isWrite bool) {
 	encodedJwt := fs.maybeGetVolumeJwtAuthorizationToken(fileId, isWrite)
 
@@ -22,6 +26,8 @@ func (fs *FilerServer) maybeAddVolumeJwtAuthorization(r *http.Request, fileId st
 	r.Header.Set("Authorization", "BEARER "+string(encodedJwt))
 }
 
+// maybeGetVolumeJwtAuthorizationToken 封装 JWT 生成逻辑
+// 返回空字符串表示无需鉴权，例如 volumeGuard 未设置
 func (fs *FilerServer) maybeGetVolumeJwtAuthorizationToken(fileId string, isWrite bool) string {
 	var encodedJwt security.EncodedJwt
 	if isWrite {
@@ -32,6 +38,8 @@ func (fs *FilerServer) maybeGetVolumeJwtAuthorizationToken(fileId string, isWrit
 	return string(encodedJwt)
 }
 
+// proxyToVolumeServer 将请求转发给持有 fileId 的 Volume Server
+// 会从 master 缓存中选取一个地址并透传请求头，保持幂等行为
 func (fs *FilerServer) proxyToVolumeServer(w http.ResponseWriter, r *http.Request, fileId string) {
 	ctx := r.Context()
 	urlStrings, err := fs.filer.MasterClient.GetLookupFileIdFunction()(ctx, fileId)

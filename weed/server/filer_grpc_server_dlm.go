@@ -1,3 +1,5 @@
+// Package weed_server 中的 filer_grpc_server_dlm.go 实现分布式锁管理相关的 gRPC 接口
+// 提供锁的申请、释放、查询以及在集群拓扑变化时的迁移。
 package weed_server
 
 import (
@@ -13,7 +15,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// DistributedLock is a grpc handler to handle FilerServer's LockRequest
+// DistributedLock 处理 FilerServer 的锁申请请求
+// 支持当锁不在当前节点时自动转发，确保客户端透明
 func (fs *FilerServer) DistributedLock(ctx context.Context, req *filer_pb.LockRequest) (resp *filer_pb.LockResponse, err error) {
 
 	glog.V(4).Infof("FILER LOCK: Received DistributedLock request - name=%s owner=%s renewToken=%s secondsToLock=%d isMoved=%v",
@@ -63,7 +66,8 @@ func (fs *FilerServer) DistributedLock(ctx context.Context, req *filer_pb.LockRe
 	return resp, nil
 }
 
-// Unlock is a grpc handler to handle FilerServer's UnlockRequest
+// DistributedUnlock 释放指定的锁
+// 若锁已经迁移则自动转发到新节点执行
 func (fs *FilerServer) DistributedUnlock(ctx context.Context, req *filer_pb.UnlockRequest) (resp *filer_pb.UnlockResponse, err error) {
 
 	resp = &filer_pb.UnlockResponse{}
@@ -94,6 +98,8 @@ func (fs *FilerServer) DistributedUnlock(ctx context.Context, req *filer_pb.Unlo
 
 }
 
+// FindLockOwner 查询指定锁当前的持有者
+// 若锁已迁移则再次转发，找不到时返回 NotFound
 func (fs *FilerServer) FindLockOwner(ctx context.Context, req *filer_pb.FindLockOwnerRequest) (*filer_pb.FindLockOwnerResponse, error) {
 	owner, movedTo, err := fs.filer.Dlm.FindLockOwner(req.Name)
 	if !req.IsMoved && movedTo != "" || err == lock_manager.LockNotFound {
@@ -126,7 +132,7 @@ func (fs *FilerServer) FindLockOwner(ctx context.Context, req *filer_pb.FindLock
 	}, nil
 }
 
-// TransferLocks is a grpc handler to handle FilerServer's TransferLocksRequest
+// TransferLocks 在节点上线或拓扑调整时批量同步锁信息
 func (fs *FilerServer) TransferLocks(ctx context.Context, req *filer_pb.TransferLocksRequest) (*filer_pb.TransferLocksResponse, error) {
 
 	for _, lock := range req.Locks {
@@ -137,6 +143,8 @@ func (fs *FilerServer) TransferLocks(ctx context.Context, req *filer_pb.Transfer
 
 }
 
+// OnDlmChangeSnapshot 响应 DLM 拓扑快照变更事件
+// 会将不再归属当前节点的锁主动推送到目标节点
 func (fs *FilerServer) OnDlmChangeSnapshot(snapshot []pb.ServerAddress) {
 	locks := fs.filer.Dlm.SelectNotOwnedLocks(snapshot)
 	if len(locks) == 0 {
@@ -145,7 +153,7 @@ func (fs *FilerServer) OnDlmChangeSnapshot(snapshot []pb.ServerAddress) {
 
 	for _, lock := range locks {
 		server := fs.filer.Dlm.CalculateTargetServer(lock.Key, snapshot)
-		// Use a context with timeout for lock transfer to avoid hanging indefinitely
+		// 使用超时上下文，避免锁迁移在网络异常时长时间阻塞
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := pb.WithFilerClient(false, 0, server, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			_, err := client.TransferLocks(ctx, &filer_pb.TransferLocksRequest{
@@ -162,7 +170,7 @@ func (fs *FilerServer) OnDlmChangeSnapshot(snapshot []pb.ServerAddress) {
 		})
 		cancel()
 		if err != nil {
-			// it may not be worth retrying, since the lock may have expired
+			// 此处不重试：锁可能已过期或被新的节点抢占
 			glog.Errorf("transfer lock %v to %v: %v", lock.Key, server, err)
 		}
 	}

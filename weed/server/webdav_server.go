@@ -1,3 +1,51 @@
+// Package weed_server 实现 WebDAV 服务器功能
+// 本文件提供完整的 WebDAV 协议支持，允许通过 WebDAV 客户端访问 SeaweedFS Filer
+//
+// 核心功能:
+//   - WebDavServer: WebDAV 服务器，处理 WebDAV 请求
+//   - WebDavFileSystem: 实现 webdav.FileSystem 接口，桥接到 SeaweedFS Filer
+//   - WebDavFile: 文件操作对象，支持读写、Seek、目录遍历
+//   - FileInfo: 文件信息对象，实现 os.FileInfo 和 webdav.ETager 接口
+//
+// WebDAV 协议支持:
+//   - 标准方法：GET、PUT、DELETE、MKCOL、PROPFIND、PROPPATCH
+//   - 文件操作：读取、写入、删除、重命名、复制、移动
+//   - 目录操作：创建、列举、删除
+//   - 属性查询：文件大小、修改时间、权限、ETag
+//   - 锁定机制：防止并发修改冲突
+//
+// 使用场景:
+//   - Windows 资源管理器：映射网络驱动器访问 SeaweedFS
+//   - macOS Finder：连接到服务器，浏览文件
+//   - Linux davfs2：挂载 WebDAV 为本地文件系统
+//   - 第三方应用：任何支持 WebDAV 的应用（如办公软件）
+//
+// 架构设计:
+//   1. WebDAV 客户端 → WebDavServer → webdav.Handler
+//   2. webdav.Handler → WebDavFileSystem（实现文件系统接口）
+//   3. WebDavFileSystem → Filer gRPC Client → SeaweedFS Filer
+//   4. 文件数据：通过 chunk 分片存储在 Volume Server
+//
+// 缓存机制:
+//   - ReaderCache：缓存文件读取器，减少重复打开文件
+//   - TieredChunkCache：两层缓存（内存 + 磁盘），加速数据读取
+//   - 缓存唯一 ID：基于 Filer 地址和版本号，避免冲突
+//
+// 分块上传:
+//   - 使用 BufferedWriteCloser 缓冲写入
+//   - 达到阈值（MaxMB）后自动上传到 Volume Server
+//   - 支持增量追加写入
+//
+// 权限控制:
+//   - Uid/Gid：创建文件和目录时设置所有者
+//   - FileMode：支持标准 Unix 权限位
+//   - Collection/Replication：控制数据存储策略
+//
+// 注意事项:
+//   - WebDAV 性能低于原生 API（多次往返、协议开销）
+//   - 适合小文件和低频访问场景
+//   - 大文件上传建议直接使用 HTTP API
+//   - 锁定机制在内存中（重启丢失）
 package weed_server
 
 import (
@@ -26,31 +74,72 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/security"
 )
 
+// WebDavOption WebDAV 服务器配置选项
+//
+// 字段说明:
+//   - Filer: Filer 服务器地址（如 "localhost:8888"）
+//   - FilerRootPath: Filer 根路径，WebDAV 访问的起始目录（如 "/webdav"）
+//   - DomainName: 域名（可选）
+//   - BucketsPath: S3 bucket 路径（可选）
+//   - GrpcDialOption: gRPC 连接选项（TLS、认证等）
+//   - Collection: 文件集合名称，用于逻辑分组
+//   - Replication: 副本策略（如 "000"、"001"、"010"）
+//   - DiskType: 磁盘类型（hdd、ssd、nvme）
+//   - Uid: 创建文件/目录的用户 ID
+//   - Gid: 创建文件/目录的组 ID
+//   - Cipher: 是否启用加密
+//   - CacheDir: 缓存目录路径
+//   - CacheSizeMB: 磁盘缓存大小（MB）
+//   - MaxMB: 单个文件分片大小上限（MB）
+//
+// 示例配置:
+//   option := &WebDavOption{
+//       Filer: "localhost:8888",
+//       FilerRootPath: "/webdav",
+//       Collection: "documents",
+//       Replication: "001",
+//       DiskType: "hdd",
+//       Uid: 1000,
+//       Gid: 1000,
+//       CacheDir: "/tmp/seaweedfs-cache",
+//       CacheSizeMB: 1000,
+//       MaxMB: 4,
+//   }
 type WebDavOption struct {
-	Filer          pb.ServerAddress
-	FilerRootPath  string
-	DomainName     string
-	BucketsPath    string
-	GrpcDialOption grpc.DialOption
-	Collection     string
-	Replication    string
-	DiskType       string
-	Uid            uint32
-	Gid            uint32
-	Cipher         bool
-	CacheDir       string
-	CacheSizeMB    int64
-	MaxMB          int
+	Filer          pb.ServerAddress  // Filer 服务器地址
+	FilerRootPath  string            // Filer 根路径（WebDAV 起始目录）
+	DomainName     string            // 域名（可选）
+	BucketsPath    string            // S3 bucket 路径（可选）
+	GrpcDialOption grpc.DialOption   // gRPC 连接选项
+	Collection     string            // 文件集合名称
+	Replication    string            // 副本策略（如 "001"）
+	DiskType       string            // 磁盘类型（hdd/ssd/nvme）
+	Uid            uint32            // 用户 ID
+	Gid            uint32            // 组 ID
+	Cipher         bool              // 是否启用加密
+	CacheDir       string            // 缓存目录
+	CacheSizeMB    int64             // 磁盘缓存大小（MB）
+	MaxMB          int               // 单个文件分片大小上限（MB）
 }
 
+// WebDavServer WebDAV 服务器主对象
+// 处理所有 WebDAV 协议请求
+//
+// 字段说明:
+//   - option: WebDAV 配置选项
+//   - secret: 签名密钥（用于认证）
+//   - filer: Filer 对象（可选，用于本地 Filer）
+//   - grpcDialOption: gRPC 连接选项
+//   - Handler: webdav.Handler（标准 WebDAV 处理器）
 type WebDavServer struct {
-	option         *WebDavOption
-	secret         security.SigningKey
-	filer          *filer.Filer
-	grpcDialOption grpc.DialOption
-	Handler        *webdav.Handler
+	option         *WebDavOption        // 配置选项
+	secret         security.SigningKey  // 签名密钥
+	filer          *filer.Filer         // Filer 对象（可选）
+	grpcDialOption grpc.DialOption      // gRPC 连接选项
+	Handler        *webdav.Handler      // WebDAV 处理器
 }
 
+// max 返回两个 int64 中的较大值
 func max(x, y int64) int64 {
 	if x <= y {
 		return y
@@ -58,59 +147,143 @@ func max(x, y int64) int64 {
 	return x
 }
 
+// NewWebDavServer 创建 WebDAV 服务器实例
+//
+// 参数:
+//   - option: WebDAV 配置选项
+//
+// 返回:
+//   - ws: WebDavServer 实例
+//   - err: 创建错误
+//
+// 功能:
+//   1. 创建 WebDavFileSystem（连接到 Filer）
+//   2. 根据 FilerRootPath 配置创建包装文件系统
+//   3. 创建 webdav.Handler（标准 WebDAV 处理器）
+//   4. 配置内存锁系统（NewMemLS）
+//
+// 路径处理:
+//   - FilerRootPath = "/": 访问 Filer 根目录
+//   - FilerRootPath = "/webdav": 访问 Filer 的 /webdav 子目录
+//   - 使用 WrappedFs 实现路径映射（对客户端透明）
+//
+// 使用示例:
+//   option := &WebDavOption{
+//       Filer: "localhost:8888",
+//       FilerRootPath: "/webdav",
+//       Collection: "documents",
+//       Replication: "001",
+//   }
+//   server, err := NewWebDavServer(option)
+//   if err != nil {
+//       log.Fatal(err)
+//   }
+//   http.Handle("/", server.Handler)
 func NewWebDavServer(option *WebDavOption) (ws *WebDavServer, err error) {
 
+	// 【创建 WebDAV 文件系统】
+	// 连接到 Filer，实现 webdav.FileSystem 接口
 	fs, _ := NewWebDavFileSystem(option)
 
-	// Fix no set filer.path , accessing "/" returns "//"
+	// 【修正根路径配置】
+	// 避免访问 "/" 时返回 "//"
 	if option.FilerRootPath == "/" {
 		option.FilerRootPath = ""
 	}
-	// filer.path non "/" option means we are accessing filer's sub-folders
+
+	// 【配置子文件夹访问】
+	// FilerRootPath 不为空表示访问 Filer 的子文件夹
+	// 使用 WrappedFs 实现路径映射，对客户端透明
 	if option.FilerRootPath != "" {
 		fs = NewWrappedFs(fs, path.Clean(option.FilerRootPath))
 	}
 
+	// 【创建 WebDavServer】
 	ws = &WebDavServer{
 		option:         option,
 		grpcDialOption: security.LoadClientTLS(util.GetViper(), "grpc.filer"),
 		Handler: &webdav.Handler{
-			FileSystem: fs,
-			LockSystem: webdav.NewMemLS(),
+			FileSystem: fs,                 // 文件系统实现
+			LockSystem: webdav.NewMemLS(),  // 内存锁系统
 		},
 	}
 
 	return ws, nil
 }
 
-// adapted from https://github.com/mattn/davfs/blob/master/plugin/mysql/mysql.go
+// 本文件的 WebDAV 文件系统实现改编自：
+// https://github.com/mattn/davfs/blob/master/plugin/mysql/mysql.go
 
+// WebDavFileSystem WebDAV 文件系统实现
+// 实现 webdav.FileSystem 接口，桥接到 SeaweedFS Filer
+//
+// 字段说明:
+//   - option: WebDAV 配置选项
+//   - secret: 签名密钥（认证）
+//   - grpcDialOption: gRPC 连接选项
+//   - chunkCache: 分片缓存（内存 + 磁盘两层）
+//   - readerCache: 读取器缓存（减少重复打开文件）
+//   - signature: 签名标识符（随机生成，用于识别客户端）
+//
+// 接口实现:
+//   - Mkdir: 创建目录
+//   - OpenFile: 打开或创建文件
+//   - RemoveAll: 删除文件或目录
+//   - Rename: 重命名或移动
+//   - Stat: 获取文件信息
+//
+// 缓存机制:
+//   - TieredChunkCache: 两层缓存（内存 256MB + 磁盘可配置）
+//   - ReaderCache: 缓存 32 个文件读取器
+//   - 缓存目录：<CacheDir>/<UniqueId>/
 type WebDavFileSystem struct {
-	option         *WebDavOption
-	secret         security.SigningKey
-	grpcDialOption grpc.DialOption
-	chunkCache     *chunk_cache.TieredChunkCache
-	readerCache    *filer.ReaderCache
-	signature      int32
+	option         *WebDavOption                   // 配置选项
+	secret         security.SigningKey             // 签名密钥
+	grpcDialOption grpc.DialOption                 // gRPC 连接选项
+	chunkCache     *chunk_cache.TieredChunkCache   // 分片缓存
+	readerCache    *filer.ReaderCache              // 读取器缓存
+	signature      int32                           // 签名标识符
 }
 
+// FileInfo 文件信息对象
+// 实现 os.FileInfo 和 webdav.ETager 接口
+//
+// 字段说明:
+//   - name: 文件名（不包含路径）
+//   - size: 文件大小（字节）
+//   - mode: 文件权限模式
+//   - modifiedTime: 最后修改时间
+//   - etag: ETag 值（用于缓存验证）
+//   - isDirectory: 是否为目录
+//   - err: 错误信息（如果获取 FileInfo 时出错）
 type FileInfo struct {
-	name         string
-	size         int64
-	mode         os.FileMode
-	modifiedTime time.Time
-	etag         string
-	isDirectory  bool
-	err          error
+	name         string      // 文件名
+	size         int64       // 文件大小
+	mode         os.FileMode // 权限模式
+	modifiedTime time.Time   // 修改时间
+	etag         string      // ETag
+	isDirectory  bool        // 是否为目录
+	err          error       // 错误信息
 }
 
-func (fi *FileInfo) Name() string       { return fi.name }
-func (fi *FileInfo) Size() int64        { return fi.size }
-func (fi *FileInfo) Mode() os.FileMode  { return fi.mode }
-func (fi *FileInfo) ModTime() time.Time { return fi.modifiedTime }
-func (fi *FileInfo) IsDir() bool        { return fi.isDirectory }
-func (fi *FileInfo) Sys() interface{}   { return nil }
+// 以下方法实现 os.FileInfo 接口
 
+func (fi *FileInfo) Name() string       { return fi.name }         // 返回文件名
+func (fi *FileInfo) Size() int64        { return fi.size }         // 返回文件大小
+func (fi *FileInfo) Mode() os.FileMode  { return fi.mode }         // 返回权限模式
+func (fi *FileInfo) ModTime() time.Time { return fi.modifiedTime } // 返回修改时间
+func (fi *FileInfo) IsDir() bool        { return fi.isDirectory }  // 是否为目录
+func (fi *FileInfo) Sys() interface{}   { return nil }             // 系统相关信息（未使用）
+
+// ETag 返回文件的 ETag 值（实现 webdav.ETager 接口）
+// ETag 用于 HTTP 缓存验证和并发控制
+//
+// 参数:
+//   - ctx: 上下文
+//
+// 返回:
+//   - string: ETag 值
+//   - error: 错误信息
 func (fi *FileInfo) ETag(ctx context.Context) (string, error) {
 	if fi.err != nil {
 		return "", fi.err
@@ -118,36 +291,114 @@ func (fi *FileInfo) ETag(ctx context.Context) (string, error) {
 	return fi.etag, nil
 }
 
+// WebDavFile WebDAV 文件对象
+// 实现 webdav.File 接口，支持读写、Seek、目录遍历
+//
+// 字段说明:
+//   - fs: 所属的 WebDavFileSystem
+//   - name: 文件完整路径
+//   - isDirectory: 是否为目录
+//   - off: 当前读取偏移量（用于 Seek）
+//   - entry: Filer 的 Entry 对象（文件元数据）
+//   - visibleIntervals: 可见的数据区间（用于稀疏文件）
+//   - reader: 文件读取器
+//   - bufWriter: 缓冲写入器（用于上传）
+//   - ctx: 上下文
+//
+// 文件操作:
+//   - Read: 读取文件数据
+//   - Write: 写入文件数据
+//   - Seek: 移动读取位置
+//   - Readdir: 读取目录内容
+//   - Stat: 获取文件信息
+//   - Close: 关闭文件（刷新写入缓冲）
 type WebDavFile struct {
-	fs               *WebDavFileSystem
-	name             string
-	isDirectory      bool
-	off              int64
-	entry            *filer_pb.Entry
-	visibleIntervals *filer.IntervalList[*filer.VisibleInterval]
-	reader           io.ReaderAt
-	bufWriter        *buffered_writer.BufferedWriteCloser
-	ctx              context.Context
+	fs               *WebDavFileSystem                            // 所属文件系统
+	name             string                                       // 文件路径
+	isDirectory      bool                                         // 是否为目录
+	off              int64                                        // 当前偏移量
+	entry            *filer_pb.Entry                              // Filer Entry
+	visibleIntervals *filer.IntervalList[*filer.VisibleInterval] // 可见区间
+	reader           io.ReaderAt                                  // 读取器
+	bufWriter        *buffered_writer.BufferedWriteCloser        // 缓冲写入器
+	ctx              context.Context                              // 上下文
 }
 
+// NewWebDavFileSystem 创建 WebDAV 文件系统实例
+//
+// 参数:
+//   - option: WebDAV 配置选项
+//
+// 返回:
+//   - webdav.FileSystem: 文件系统实例
+//   - error: 创建错误
+//
+// 功能:
+//   1. 创建缓存目录（基于 Filer 地址和版本号生成唯一 ID）
+//   2. 初始化两层分片缓存（内存 256MB + 磁盘）
+//   3. 创建读取器缓存（缓存 32 个文件读取器）
+//   4. 生成随机签名标识符
+//
+// 缓存设计:
+//   - 内存缓存：256MB，存储热点数据
+//   - 磁盘缓存：可配置大小（CacheSizeMB），存储温数据
+//   - 缓存粒度：1MB 分片
+//   - 缓存目录：<CacheDir>/<UniqueId>/
+//
+// 使用示例:
+//   option := &WebDavOption{
+//       Filer: "localhost:8888",
+//       CacheDir: "/tmp/webdav-cache",
+//       CacheSizeMB: 1000,
+//   }
+//   fs, err := NewWebDavFileSystem(option)
 func NewWebDavFileSystem(option *WebDavOption) (webdav.FileSystem, error) {
 
+	// 【生成缓存唯一 ID】
+	// 基于 "webdav" + Filer 地址 + SeaweedFS 版本号
+	// 确保不同 Filer 或版本不会共享缓存
 	cacheUniqueId := util.Md5String([]byte("webdav" + string(option.Filer) + version.Version()))[0:8]
 	cacheDir := path.Join(option.CacheDir, cacheUniqueId)
 
+	// 【创建缓存目录】
 	os.MkdirAll(cacheDir, os.FileMode(0755))
+
+	// 【创建两层分片缓存】
+	// 参数：内存缓存 256MB、磁盘缓存目录、磁盘缓存大小、分片大小 1MB
 	chunkCache := chunk_cache.NewTieredChunkCache(256, cacheDir, option.CacheSizeMB, 1024*1024)
+
+	// 【创建 WebDavFileSystem】
 	t := &WebDavFileSystem{
 		option:     option,
 		chunkCache: chunkCache,
-		signature:  util.RandomInt32(),
+		signature:  util.RandomInt32(),  // 随机签名标识符
 	}
+
+	// 【创建读取器缓存】
+	// 缓存 32 个文件读取器，减少重复打开文件的开销
 	t.readerCache = filer.NewReaderCache(32, chunkCache, filer.LookupFn(t))
+
 	return t, nil
 }
 
+// 编译时检查：确保 WebDavFileSystem 实现了 filer_pb.FilerClient 接口
 var _ = filer_pb.FilerClient(&WebDavFileSystem{})
 
+// WithFilerClient 执行需要 Filer gRPC 客户端的操作
+// 实现 filer_pb.FilerClient 接口
+//
+// 参数:
+//   - streamingMode: 是否使用流式传输模式
+//   - fn: 使用 Filer 客户端的回调函数
+//
+// 返回:
+//   - error: 执行错误
+//
+// 功能:
+//   - 建立到 Filer 的 gRPC 连接
+//   - 创建 SeaweedFilerClient
+//   - 执行回调函数
+//   - 自动关闭连接
 func (fs *WebDavFileSystem) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
 	return pb.WithGrpcClient(streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
@@ -156,43 +407,109 @@ func (fs *WebDavFileSystem) WithFilerClient(streamingMode bool, fn func(filer_pb
 	}, fs.option.Filer.ToGrpcAddress(), false, fs.option.GrpcDialOption)
 
 }
+
+// AdjustedUrl 返回调整后的 Volume Server URL
+// 实现 filer_pb.FilerClient 接口
+//
+// 参数:
+//   - location: Volume 位置信息
+//
+// 返回:
+//   - string: Volume Server URL
 func (fs *WebDavFileSystem) AdjustedUrl(location *filer_pb.Location) string {
 	return location.Url
 }
+
+// GetDataCenter 返回数据中心名称
+// 实现 filer_pb.FilerClient 接口
+//
+// 返回:
+//   - string: 数据中心名称（WebDAV 不使用，返回空字符串）
 func (fs *WebDavFileSystem) GetDataCenter() string {
 	return ""
 }
 
+// clearName 清理和规范化路径名称
+// 确保路径以 / 开头，保留尾部 / 的语义（表示目录）
+//
+// 参数:
+//   - name: 原始路径名
+//
+// 返回:
+//   - string: 清理后的路径
+//   - error: 路径无效时返回 os.ErrInvalid
+//
+// 规范化规则:
+//   - 使用 path.Clean 清理路径（去除 .、..、多余的 /）
+//   - 保留尾部 /（表示这是目录路径）
+//   - 确保以 / 开头（绝对路径）
+//
+// 示例:
+//   - "/a/b/" → "/a/b/"（保留尾部 /）
+//   - "/a//b" → "/a/b"（去除多余 /）
+//   - "a/b" → error（必须是绝对路径）
 func clearName(name string) (string, error) {
+	// 【记录是否以 / 结尾】
 	slashed := strings.HasSuffix(name, "/")
+
+	// 【清理路径】
+	// path.Clean 会去除尾部 /，需要后续恢复
 	name = path.Clean(name)
+
+	// 【恢复尾部 /】
+	// 如果原路径以 / 结尾（目录），添加回去
 	if !strings.HasSuffix(name, "/") && slashed {
 		name += "/"
 	}
+
+	// 【验证是绝对路径】
+	// WebDAV 要求所有路径都是绝对路径
 	if !strings.HasPrefix(name, "/") {
 		return "", os.ErrInvalid
 	}
+
 	return name, nil
 }
 
+// Mkdir 创建目录
+// 实现 webdav.FileSystem 接口
+//
+// 参数:
+//   - ctx: 上下文
+//   - fullDirPath: 目录完整路径（如 "/documents/2023"）
+//   - perm: 目录权限
+//
+// 返回:
+//   - error: 创建错误（目录已存在、权限不足等）
+//
+// 工作流程:
+//   1. 确保路径以 / 结尾（目录标记）
+//   2. 清理和验证路径
+//   3. 检查目录是否已存在
+//   4. 调用 Filer gRPC 创建目录
+//   5. 设置目录属性（权限、所有者、时间戳）
 func (fs *WebDavFileSystem) Mkdir(ctx context.Context, fullDirPath string, perm os.FileMode) error {
 
 	glog.V(2).Infof("WebDavFileSystem.Mkdir %v", fullDirPath)
 
+	// 【确保目录路径以 / 结尾】
 	if !strings.HasSuffix(fullDirPath, "/") {
 		fullDirPath += "/"
 	}
 
+	// 【清理路径】
 	var err error
 	if fullDirPath, err = clearName(fullDirPath); err != nil {
 		return err
 	}
 
+	// 【检查目录是否已存在】
 	_, err = fs.stat(ctx, fullDirPath)
 	if err == nil {
 		return os.ErrExist
 	}
 
+	// 【调用 Filer 创建目录】
 	return fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		dir, name := util.FullPath(fullDirPath).DirAndName()
 		request := &filer_pb.CreateEntryRequest{
@@ -220,16 +537,43 @@ func (fs *WebDavFileSystem) Mkdir(ctx context.Context, fullDirPath string, perm 
 	})
 }
 
+// OpenFile 打开或创建文件
+// 实现 webdav.FileSystem 接口
+//
+// 参数:
+//   - ctx: 上下文
+//   - fullFilePath: 文件完整路径（如 "/documents/report.pdf"）
+//   - flag: 打开标志（os.O_RDONLY、os.O_WRONLY、os.O_CREATE 等）
+//   - perm: 文件权限（创建文件时使用）
+//
+// 返回:
+//   - webdav.File: WebDavFile 对象，支持读写、Seek 等操作
+//   - error: 打开错误
+//
+// 打开标志:
+//   - os.O_RDONLY: 只读
+//   - os.O_WRONLY: 只写
+//   - os.O_RDWR: 读写
+//   - os.O_CREATE: 文件不存在时创建
+//   - os.O_EXCL: 与 O_CREATE 配合使用，文件存在时返回错误
+//   - os.O_TRUNC: 打开时清空文件内容
+//
+// 工作模式:
+//   - 创建模式（O_CREATE）：创建新文件，设置属性
+//   - 读取模式：从 Filer 查询文件，返回 WebDavFile
+//   - 写入模式：打开文件并创建 BufferedWriteCloser
 func (fs *WebDavFileSystem) OpenFile(ctx context.Context, fullFilePath string, flag int, perm os.FileMode) (webdav.File, error) {
 	glog.V(2).Infof("WebDavFileSystem.OpenFile %v %x", fullFilePath, flag)
 
+	// 【清理路径】
 	var err error
 	if fullFilePath, err = clearName(fullFilePath); err != nil {
 		return nil, err
 	}
 
+	// 【创建模式】
 	if flag&os.O_CREATE != 0 {
-		// file should not have / suffix.
+		// 文件路径不应以 / 结尾
 		if strings.HasSuffix(fullFilePath, "/") {
 			return nil, os.ErrInvalid
 		}

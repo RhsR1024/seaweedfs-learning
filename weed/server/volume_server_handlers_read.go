@@ -1,5 +1,74 @@
-// Package weed_server 包含 Volume Server 的 HTTP 处理函数
-// 本文件主要处理文件读取（下载）请求
+// Package weed_server 实现 Volume Server 的文件读取（下载）HTTP Handler
+// 本文件是 SeaweedFS 文件下载功能的核心实现，提供完整的 HTTP 文件访问能力
+//
+// 核心功能:
+//   - GetOrHeadHandler: 主下载处理函数，处理 GET/HEAD 请求
+//   - proxyReqToTargetServer: Volume 不在本地时的代理/重定向逻辑
+//   - parseURLPath: URL 路径解析（提取 vid、fid、filename）
+//   - writeResponseContent: 文件内容写入响应（支持 Range 请求）
+//   - conditionallyCropImages: 图片裁剪功能
+//   - conditionallyResizeImages: 图片缩放功能
+//
+// 文件下载流程:
+//   1. 客户端请求：GET http://localhost:8080/3,01e3b0756f
+//   2. 解析 URL：volumeId=3, fileKey=01e3b0756f
+//   3. JWT 验证：检查访问权限（如果启用）
+//   4. 查找 Volume：
+//      - 本地普通 Volume → 直接读取
+//      - 本地 EC Volume → EC 纠删码读取
+//      - 不在本地 → 代理或重定向到正确的 Volume Server
+//   5. 读取 Needle：从 .dat 文件读取 Needle 数据
+//   6. HTTP 缓存：检查 If-Modified-Since、If-None-Match
+//   7. 特殊处理：
+//      - 分块文件：读取 ChunkManifest，合并多个 chunk
+//      - 图片处理：裁剪、缩放（width、height 参数）
+//      - 压缩：gzip 解压缩
+//   8. Range 支持：处理 Range 请求头，支持断点续传
+//   9. 返回响应：设置 Content-Type、Content-Disposition 等头部
+//
+// URL 格式:
+//   基本格式：/<volumeId>,<fileKey>[_<cookie>][/filename][.ext]
+//   示例：
+//     - /3,01e3b0756f              → 下载文件
+//     - /3,01e3b0756f_a1b2c3d4     → 带 cookie 防止猜测
+//     - /3,01e3b0756f/photo.jpg    → 指定文件名
+//     - /3,01e3b0756f.jpg?width=200 → 图片缩放到宽度 200px
+//
+// ReadMode 配置:
+//   - "local"（默认）：只读取本地数据，找不到返回 404
+//   - "redirect"：返回 301 重定向到正确的 Volume Server
+//   - "proxy"：代理请求到正确的 Volume Server，返回数据
+//
+// HTTP Range 请求支持:
+//   - 单范围：Range: bytes=0-1023
+//   - 多范围：Range: bytes=0-1023,5120-6143
+//   - 后缀范围：Range: bytes=-500（最后 500 字节）
+//   - 前缀范围：Range: bytes=500-（从 500 到末尾）
+//
+// 图片处理参数:
+//   - width: 缩放宽度（保持比例）
+//   - height: 缩放高度（保持比例）
+//   - mode: 缩放模式（fit、fill 等）
+//   - crop: 裁剪参数（x,y,w,h）
+//
+// ChunkManifest 大文件:
+//   - 文件 > 阈值时，自动分块存储
+//   - Needle 存储 ChunkManifest（JSON 格式）
+//   - 下载时自动合并所有 chunk
+//   - 支持并行下载多个 chunk
+//
+// HTTP 缓存:
+//   - Last-Modified：文件修改时间
+//   - ETag：文件内容哈希值
+//   - If-Modified-Since：条件请求（304 Not Modified）
+//   - If-None-Match：ETag 验证（304 Not Modified）
+//   - Cache-Control: max-age=XXX
+//
+// 注意事项:
+//   - JWT 验证仅在启用时生效（-jwt.signing.key）
+//   - 图片处理有性能开销，建议用 CDN 缓存
+//   - Range 请求支持视频点播和断点续传
+//   - 代理模式增加延迟，重定向模式更高效
 package weed_server
 
 import (

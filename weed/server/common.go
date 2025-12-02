@@ -134,15 +134,28 @@ func bodyAllowedForStatus(status int) bool {
 //	// 普通 JSON: ?pretty=1 输出格式化 JSON
 //	// JSONP: ?callback=myFunc 输出 myFunc({"status":"success"})
 func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) (err error) {
+	// 【步骤 1：检查状态码是否允许响应体】
+	// 某些 HTTP 状态码不允许有响应体（如 1xx, 204, 304）
+	// 如果不允许，直接返回，不写入任何内容
 	if !bodyAllowedForStatus(httpStatus) {
 		return
 	}
 
+	// 【步骤 2：序列化对象为 JSON】
 	var bytes []byte
 	if obj != nil {
+		// 检查是否需要格式化输出（美化 JSON）
+		// URL 参数 ?pretty=1 会触发格式化输出
 		if r.FormValue("pretty") != "" {
+			// 使用缩进格式化，每级缩进 2 个空格
+			// 输出格式：
+			// {
+			//   "key": "value"
+			// }
 			bytes, err = json.MarshalIndent(obj, "", "  ")
 		} else {
+			// 紧凑格式（默认）
+			// 输出格式：{"key":"value"}
 			bytes, err = json.Marshal(obj)
 		}
 	}
@@ -150,32 +163,44 @@ func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj inter
 		return
 	}
 
+	// 【步骤 3：错误响应日志】
+	// 当返回错误状态码（4xx 或 5xx）时，记录详细日志用于排查问题
 	if httpStatus >= 400 {
 		glog.V(0).Infof("response method:%s URL:%s with httpStatus:%d and JSON:%s",
 			r.Method, r.URL.String(), httpStatus, string(bytes))
 	}
 
+	// 【步骤 4：输出 JSON 或 JSONP】
+	// 检查是否需要 JSONP 格式（用于跨域请求）
 	callback := r.FormValue("callback")
 	if callback == "" {
+		// 普通 JSON 响应
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(httpStatus)
+		// 304 Not Modified 不需要响应体（浏览器使用缓存）
 		if httpStatus == http.StatusNotModified {
 			return
 		}
 		_, err = w.Write(bytes)
 	} else {
+		// JSONP 响应（跨域支持）
+		// 格式：callbackName({"key":"value"})
 		w.Header().Set("Content-Type", "application/javascript")
 		w.WriteHeader(httpStatus)
 		if httpStatus == http.StatusNotModified {
 			return
 		}
+		// 写入回调函数名
 		if _, err = w.Write([]uint8(callback)); err != nil {
 			return
 		}
+		// 写入左括号
 		if _, err = w.Write([]uint8("(")); err != nil {
 			return
 		}
+		// 写入 JSON 数据
 		fmt.Fprint(w, string(bytes))
+		// 写入右括号，完成 JSONP 格式
 		if _, err = w.Write([]uint8(")")); err != nil {
 			return
 		}
@@ -408,38 +433,78 @@ func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn ope
 //	ext: 扩展名（如 ".jpg"）
 //	isVolumeIdOnly: 是否只有卷 ID（用于查询卷信息）
 func parseURLPath(path string) (vid, fid, filename, ext string, isVolumeIdOnly bool) {
+	// 【根据路径中的斜杠数量判断 URL 格式】
+	// SeaweedFS 支持三种 URL 格式，通过统计斜杠数量来区分
 	switch strings.Count(path, "/") {
 	case 3:
-		// 格式：/<vid>/<fid>/<filename>
+		// 【格式 1：/<vid>/<fid>/<filename>】
+		// 三段式路径，包含明确的文件名
 		// 例如：/3/01e3b0756f/photo.jpg
+		//   - vid: "3"
+		//   - fid: "01e3b0756f"
+		//   - filename: "photo.jpg"
+		//   - ext: ".jpg"
 		parts := strings.Split(path, "/")
 		vid, fid, filename = parts[1], parts[2], parts[3]
+		// 提取扩展名（如 ".jpg"）
 		ext = filepath.Ext(filename)
+
 	case 2:
-		// 格式：/<vid>/<fid>[.ext]
+		// 【格式 2：/<vid>/<fid>[.ext]】
+		// 两段式路径，文件名可选
 		// 例如：/3/01e3b0756f 或 /3/01e3b0756f.jpg
+		//   - vid: "3"
+		//   - fid: "01e3b0756f"
+		//   - ext: ".jpg"（如果有）
 		parts := strings.Split(path, "/")
 		vid, fid = parts[1], parts[2]
+
+		// 检查 fid 是否包含扩展名
 		dotIndex := strings.LastIndex(fid, ".")
 		if dotIndex > 0 {
-			ext = fid[dotIndex:]
-			fid = fid[0:dotIndex]
+			// 分离扩展名和文件 ID
+			ext = fid[dotIndex:]          // 扩展名：".jpg"
+			fid = fid[0:dotIndex]         // 纯文件 ID："01e3b0756f"
 		}
+
 	default:
-		// 格式：/<vid>,<fid>[.ext]（最常用）
+		// 【格式 3：/<vid>,<fid>[.ext]（最常用的格式）】
+		// 使用逗号分隔 vid 和 fid
 		// 例如：/3,01e3b0756f 或 /3,01e3b0756f.jpg
+		//   - vid: "3"
+		//   - fid: "01e3b0756f"
+		//   - ext: ".jpg"（如果有）
+
+		// 找到最后一个斜杠的位置
 		sepIndex := strings.LastIndex(path, "/")
+		// 在斜杠之后查找逗号位置
 		commaIndex := strings.LastIndex(path[sepIndex:], ",")
+
 		if commaIndex <= 0 {
-			// 只有卷 ID，没有逗号（查询卷信息时使用）
+			// 【特殊情况：只有卷 ID，没有逗号】
+			// 用于查询卷信息的 API（如 /dir/lookup?volumeId=3）
+			// 例如：/3
+			//   - vid: "3"
+			//   - isVolumeIdOnly: true
 			vid, isVolumeIdOnly = path[sepIndex+1:], true
 			return
 		}
+
+		// 在斜杠之后查找点号位置（扩展名）
 		dotIndex := strings.LastIndex(path[sepIndex:], ".")
+
+		// 提取卷 ID（逗号之前的部分）
 		vid = path[sepIndex+1 : commaIndex]
+
+		// 提取文件 ID（逗号之后的部分）
 		fid = path[commaIndex+1:]
 		ext = ""
+
 		if dotIndex > 0 {
+			// 如果有扩展名，分离出来
+			// 例如：/3,01e3b0756f.jpg
+			//   - fid: "01e3b0756f"
+			//   - ext: ".jpg"
 			fid = path[commaIndex+1 : dotIndex]
 			ext = path[dotIndex:]
 		}
@@ -625,17 +690,39 @@ func AdjustPassthroughHeaders(w http.ResponseWriter, r *http.Request, filename s
 //   - 如果 Content-Disposition 已存在，不会覆盖
 //   - 文件名会进行 URL 编码，处理特殊字符
 func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, filename string) {
+	// 【步骤 1：检查是否已设置 Content-Disposition】
+	// 如果响应头已经包含 Content-Disposition，不再覆盖
+	// 避免与其他中间件或处理函数冲突
 	if contentDisposition := w.Header().Get("Content-Disposition"); contentDisposition != "" {
 		return
 	}
+
+	// 【步骤 2：设置 Content-Disposition 头】
 	if filename != "" {
+		// 对文件名进行 URL 编码，处理特殊字符
+		// 例如："我的文件.jpg" -> "%E6%88%91%E7%9A%84%E6%96%87%E4%BB%B6.jpg"
 		filename = url.QueryEscape(filename)
+
+		// 默认为 "inline"（在线显示）
+		// 浏览器会尝试在浏览器窗口中直接打开文件
+		// 适用于图片、PDF、视频等可预览的文件类型
 		contentDisposition := "inline"
+
+		// 【检查是否强制下载】
+		// URL 参数 ?dl=true 会强制浏览器下载文件
+		// 而不是在线预览
 		if r.FormValue("dl") != "" {
 			if dl, _ := strconv.ParseBool(r.FormValue("dl")); dl {
+				// 设置为 "attachment"（附件下载）
+				// 浏览器会弹出下载对话框
 				contentDisposition = "attachment"
 			}
 		}
+
+		// 【设置响应头】
+		// 格式：Content-Disposition: inline; filename="photo.jpg"
+		//      或 Content-Disposition: attachment; filename="document.pdf"
+		// fileNameEscaper.Replace 进一步处理文件名中的特殊字符
 		w.Header().Set("Content-Disposition", contentDisposition+`; filename="`+fileNameEscaper.Replace(filename)+`"`)
 	}
 }
@@ -689,23 +776,39 @@ func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, file
 //   - 416 Range Not Satisfiable: 范围无效或超出文件大小
 //   - 500 Internal Server Error: 数据读取失败
 func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64, mimeType string, prepareWriteFn func(offset int64, size int64) (filer.DoStreamContent, error)) error {
+	// 【步骤 1：获取 Range 请求头】
+	// Range 头格式：Range: bytes=start-end
+	// 例如：Range: bytes=0-1023 表示请求前 1KB
 	rangeReq := r.Header.Get("Range")
+
+	// 【步骤 2：从对象池获取缓冲写入器】
+	// 使用缓冲写入器提高性能，避免频繁的系统调用
 	bufferedWriter := writePool.Get().(*bufio.Writer)
 	bufferedWriter.Reset(w)
 	defer func() {
+		// 确保数据被刷新到响应中
 		bufferedWriter.Flush()
+		// 归还缓冲写入器到对象池，供下次复用
 		writePool.Put(bufferedWriter)
 	}()
 
+	// 【步骤 3：处理完整内容请求（无 Range 头）】
 	if rangeReq == "" {
+		// 没有 Range 头，返回完整文件内容
+		// 设置 Content-Length 为文件总大小
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+
+		// 准备写入完整文件（从偏移 0 开始，长度为 totalSize）
 		writeFn, err := prepareWriteFn(0, totalSize)
 		if err != nil {
 			glog.Errorf("ProcessRangeRequest: %v", err)
+			// 发生错误时删除 Content-Length 头，避免误导客户端
 			w.Header().Del("Content-Length")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return fmt.Errorf("ProcessRangeRequest: %w", err)
 		}
+
+		// 执行实际的数据写入
 		if err = writeFn(bufferedWriter); err != nil {
 			glog.Errorf("ProcessRangeRequest: %v", err)
 			w.Header().Del("Content-Length")
@@ -715,40 +818,57 @@ func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 		return nil
 	}
 
-	//the rest is dealing with partial content request
-	//mostly copy from src/pkg/net/http/fs.go
+	// 【步骤 4：处理部分内容请求（有 Range 头）】
+	// 以下代码主要参考自 Go 标准库 src/pkg/net/http/fs.go
+	// 解析 Range 头，提取请求的字节范围
+	// 例如："bytes=0-1023,2048-3071" -> [{0, 1024}, {2048, 1024}]
 	ranges, err := parseRange(rangeReq, totalSize)
 	if err != nil {
 		glog.Errorf("ProcessRangeRequest headers: %+v err: %v", w.Header(), err)
+		// 416 Range Not Satisfiable：范围无效或超出文件大小
 		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
 		return fmt.Errorf("ProcessRangeRequest header: %w", err)
 	}
+
+	// 【步骤 5：安全性检查】
+	// 验证所有范围的总大小不超过文件大小
 	if sumRangesSize(ranges) > totalSize {
-		// The total number of bytes in all the ranges
-		// is larger than the size of the file by
-		// itself, so this is probably an attack, or a
-		// dumb client.  Ignore the range request.
+		// 所有范围的总字节数大于文件本身的大小
+		// 这可能是攻击行为（试图耗尽服务器资源）
+		// 或者是错误的客户端实现
+		// 忽略此 Range 请求，不处理
 		return nil
 	}
+
+	// 空范围列表，直接返回
 	if len(ranges) == 0 {
 		return nil
 	}
+	// 【步骤 6：处理单范围请求】
 	if len(ranges) == 1 {
-		// RFC 2616, Section 14.16:
-		// "When an HTTP message includes the content of a single
-		// range (for example, a response to a request for a
-		// single range, or to a request for a set of ranges
-		// that overlap without any holes), this content is
-		// transmitted with a Content-Range header, and a
-		// Content-Length header showing the number of bytes
-		// actually transferred.
-		// ...
-		// A response to a request for a single range MUST NOT
-		// be sent using the multipart/byteranges media type."
+		// 【RFC 2616, Section 14.16 规范要求】
+		// 当 HTTP 消息包含单个范围的内容时（例如对单个范围的请求响应，
+		// 或对一组重叠范围的请求响应），该内容必须：
+		//   1. 使用 Content-Range 头传输
+		//   2. 使用 Content-Length 头显示实际传输的字节数
+		//   3. 不得使用 multipart/byteranges 媒体类型
+		//
+		// 单范围响应示例：
+		//   HTTP/1.1 206 Partial Content
+		//   Content-Range: bytes 0-1023/10240
+		//   Content-Length: 1024
+		//   [1024 字节的数据]
+
 		ra := ranges[0]
+
+		// 设置响应头
+		// Content-Length：实际返回的字节数（范围长度）
 		w.Header().Set("Content-Length", strconv.FormatInt(ra.length, 10))
+		// Content-Range：范围信息，格式 "bytes start-end/total"
+		// 例如："bytes 0-1023/10240" 表示返回 0-1023 字节，总共 10240 字节
 		w.Header().Set("Content-Range", ra.contentRange(totalSize))
 
+		// 准备写入指定范围的数据
 		writeFn, err := prepareWriteFn(ra.start, ra.length)
 		if err != nil {
 			glog.Errorf("ProcessRangeRequest range[0]: %+v err: %v", w.Header(), err)
@@ -756,65 +876,126 @@ func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return fmt.Errorf("ProcessRangeRequest: %w", err)
 		}
+
+		// 发送 206 Partial Content 状态码
 		w.WriteHeader(http.StatusPartialContent)
+
+		// 执行数据写入
 		err = writeFn(bufferedWriter)
 		if err != nil {
 			glog.Errorf("ProcessRangeRequest range[0]: %+v err: %v", w.Header(), err)
-			// Cannot call http.Error() here because WriteHeader was already called
+			// 注意：此时无法调用 http.Error()，因为 WriteHeader 已被调用
+			// HTTP 响应头已发送，只能返回错误
 			return fmt.Errorf("ProcessRangeRequest range[0]: %w", err)
 		}
 		return nil
 	}
 
-	// process multiple ranges
+	// 【步骤 7：处理多范围请求】
+	// 当请求包含多个范围时（如 Range: bytes=0-1023,2048-3071）
+	// 必须使用 multipart/byteranges 格式返回
+	//
+	// 多范围响应示例：
+	//   HTTP/1.1 206 Partial Content
+	//   Content-Type: multipart/byteranges; boundary=BOUNDARY_STRING
+	//
+	//   --BOUNDARY_STRING
+	//   Content-Type: video/mp4
+	//   Content-Range: bytes 0-1023/10240
+	//
+	//   [第一个范围的 1024 字节数据]
+	//   --BOUNDARY_STRING
+	//   Content-Type: video/mp4
+	//   Content-Range: bytes 2048-3071/10240
+	//
+	//   [第二个范围的 1024 字节数据]
+	//   --BOUNDARY_STRING--
+
+	// 创建写入函数映射表
+	// 键：范围索引，值：对应的数据写入函数
 	writeFnByRange := make(map[int](func(writer io.Writer) error))
 
+	// 【步骤 7.1：验证范围并准备写入函数】
 	for i, ra := range ranges {
+		// 验证范围起始位置不超过文件大小
 		if ra.start > totalSize {
 			http.Error(w, "Out of Range", http.StatusRequestedRangeNotSatisfiable)
 			return fmt.Errorf("out of range: %w", err)
 		}
+
+		// 为每个范围准备写入函数
 		writeFn, err := prepareWriteFn(ra.start, ra.length)
 		if err != nil {
 			glog.Errorf("ProcessRangeRequest range[%d] err: %v", i, err)
 			http.Error(w, "Internal Error", http.StatusInternalServerError)
 			return fmt.Errorf("ProcessRangeRequest range[%d] err: %v", i, err)
 		}
+		// 保存到映射表中
 		writeFnByRange[i] = writeFn
 	}
+
+	// 【步骤 7.2：计算 multipart 响应的总大小】
+	// 包括所有范围数据 + MIME 边界 + 头部信息
 	sendSize := rangesMIMESize(ranges, mimeType, totalSize)
+
+	// 【步骤 7.3：创建管道用于流式传输】
+	// pr (PipeReader): 读取端，用于向 HTTP 响应写入
+	// pw (PipeWriter): 写入端，用于 multipart writer 写入
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
+
+	// 设置 Content-Type 为 multipart/byteranges
+	// boundary 参数用于分隔不同的范围
 	w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
 	sendContent := pr
-	defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
+	defer pr.Close() // 确保管道关闭，如果 CopyN 未完成，导致写入协程退出
+
+	// 【步骤 7.4：启动后台协程写入多部分数据】
 	go func() {
+		// 遍历所有范围，依次写入
 		for i, ra := range ranges {
+			// 创建新的 multipart 部分
+			// 包含该范围的 Content-Type 和 Content-Range 头
 			part, e := mw.CreatePart(ra.mimeHeader(mimeType, totalSize))
 			if e != nil {
 				pw.CloseWithError(e)
 				return
 			}
+
+			// 获取该范围的写入函数
 			writeFn := writeFnByRange[i]
 			if writeFn == nil {
 				pw.CloseWithError(e)
 				return
 			}
+
+			// 执行数据写入到当前 part
 			if e = writeFn(part); e != nil {
 				pw.CloseWithError(e)
 				return
 			}
 		}
+
+		// 关闭 multipart writer（写入最终的边界标记）
 		mw.Close()
+		// 关闭管道写入端，通知读取端数据已完成
 		pw.Close()
 	}()
+
+	// 【步骤 7.5：设置响应头并发送数据】
+	// 如果没有内容编码，设置 Content-Length
 	if w.Header().Get("Content-Encoding") == "" {
 		w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
 	}
+
+	// 发送 206 Partial Content 状态码
 	w.WriteHeader(http.StatusPartialContent)
+
+	// 从管道读取数据并写入 HTTP 响应
+	// CopyN 确保只复制 sendSize 字节
 	if _, err := io.CopyN(bufferedWriter, sendContent, sendSize); err != nil {
 		glog.Errorf("ProcessRangeRequest err: %v", err)
-		// Cannot call http.Error() here because WriteHeader was already called
+		// 注意：此时无法调用 http.Error()，因为 WriteHeader 已被调用
 		return fmt.Errorf("ProcessRangeRequest err: %w", err)
 	}
 	return nil

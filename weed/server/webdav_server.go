@@ -619,6 +619,8 @@ func (fs *WebDavFileSystem) OpenFile(ctx context.Context, fullFilePath string, f
 		}, nil
 	}
 
+	// 【读取模式】
+	// 查询文件信息
 	fi, err := fs.stat(ctx, fullFilePath)
 	if err != nil {
 		if err == os.ErrNotExist {
@@ -626,10 +628,13 @@ func (fs *WebDavFileSystem) OpenFile(ctx context.Context, fullFilePath string, f
 		}
 		return &WebDavFile{fs: fs, ctx: ctx}, nil
 	}
+
+	// 如果是目录且路径不以 / 结尾，添加 /
 	if !strings.HasSuffix(fullFilePath, "/") && fi.IsDir() {
 		fullFilePath += "/"
 	}
 
+	// 【返回 WebDavFile 对象】
 	return &WebDavFile{
 		fs:          fs,
 		name:        fullFilePath,
@@ -640,18 +645,48 @@ func (fs *WebDavFileSystem) OpenFile(ctx context.Context, fullFilePath string, f
 
 }
 
+// removeAll 内部删除函数，递归删除文件或目录
+//
+// 参数:
+//   - ctx: 上下文
+//   - fullFilePath: 文件或目录的完整路径
+//
+// 返回:
+//   - error: 删除错误
 func (fs *WebDavFileSystem) removeAll(ctx context.Context, fullFilePath string) error {
+	// 【清理路径】
 	var err error
 	if fullFilePath, err = clearName(fullFilePath); err != nil {
 		return err
 	}
 
+	// 【分离目录和文件名】
 	dir, name := util.FullPath(fullFilePath).DirAndName()
 
+	// 【调用 Filer 删除】
+	// 参数说明：
+	//   - true: 递归删除（删除目录及其内容）
+	//   - false: 不删除分块
+	//   - false: 不是从其他集群删除
+	//   - false: 不强制删除
+	//   - []int32{fs.signature}: 签名列表
 	return filer_pb.Remove(context.Background(), fs, dir, name, true, false, false, false, []int32{fs.signature})
 
 }
 
+// RemoveAll 删除文件或目录（递归）
+// 实现 webdav.FileSystem 接口
+//
+// 参数:
+//   - ctx: 上下文
+//   - name: 文件或目录路径
+//
+// 返回:
+//   - error: 删除错误
+//
+// 功能:
+//   - 删除文件：直接删除
+//   - 删除目录：递归删除目录及其所有内容
 func (fs *WebDavFileSystem) RemoveAll(ctx context.Context, name string) error {
 
 	glog.V(2).Infof("WebDavFileSystem.RemoveAll %v", name)
@@ -659,10 +694,30 @@ func (fs *WebDavFileSystem) RemoveAll(ctx context.Context, name string) error {
 	return fs.removeAll(ctx, name)
 }
 
+// Rename 重命名或移动文件/目录
+// 实现 webdav.FileSystem 接口
+//
+// 参数:
+//   - ctx: 上下文
+//   - oldName: 旧路径
+//   - newName: 新路径
+//
+// 返回:
+//   - error: 重命名错误
+//
+// 功能:
+//   - 重命名：oldName 和 newName 在同一目录
+//   - 移动：oldName 和 newName 在不同目录
+//   - 支持文件和目录
+//
+// 注意:
+//   - 如果 newName 已存在，返回 os.ErrExist
+//   - 如果 oldName 不存在，返回 os.ErrExist
 func (fs *WebDavFileSystem) Rename(ctx context.Context, oldName, newName string) error {
 
 	glog.V(2).Infof("WebDavFileSystem.Rename %v to %v", oldName, newName)
 
+	// 【清理路径】
 	var err error
 	if oldName, err = clearName(oldName); err != nil {
 		return err
@@ -671,10 +726,14 @@ func (fs *WebDavFileSystem) Rename(ctx context.Context, oldName, newName string)
 		return err
 	}
 
+	// 【检查源文件是否存在】
 	of, err := fs.stat(ctx, oldName)
 	if err != nil {
 		return os.ErrExist
 	}
+
+	// 【处理目录路径】
+	// 目录重命名时，去除尾部 /
 	if of.IsDir() {
 		if strings.HasSuffix(oldName, "/") {
 			oldName = strings.TrimRight(oldName, "/")
@@ -684,14 +743,17 @@ func (fs *WebDavFileSystem) Rename(ctx context.Context, oldName, newName string)
 		}
 	}
 
+	// 【检查目标路径是否已存在】
 	_, err = fs.stat(ctx, newName)
 	if err == nil {
 		return os.ErrExist
 	}
 
+	// 【分离路径】
 	oldDir, oldBaseName := util.FullPath(oldName).DirAndName()
 	newDir, newBaseName := util.FullPath(newName).DirAndName()
 
+	// 【调用 Filer 原子重命名】
 	return fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
 		request := &filer_pb.AtomicRenameEntryRequest{
@@ -711,7 +773,22 @@ func (fs *WebDavFileSystem) Rename(ctx context.Context, oldName, newName string)
 	})
 }
 
+// stat 内部函数，获取文件信息
+//
+// 参数:
+//   - ctx: 上下文
+//   - fullFilePath: 文件完整路径
+//
+// 返回:
+//   - os.FileInfo: 文件信息对象
+//   - error: 获取错误
+//
+// 功能:
+//   - 从 Filer 查询 Entry
+//   - 构造 FileInfo 对象
+//   - 特殊处理根目录 "/"
 func (fs *WebDavFileSystem) stat(ctx context.Context, fullFilePath string) (os.FileInfo, error) {
+	// 【清理路径】
 	var err error
 	if fullFilePath, err = clearName(fullFilePath); err != nil {
 		return nil, err
@@ -719,6 +796,7 @@ func (fs *WebDavFileSystem) stat(ctx context.Context, fullFilePath string) (os.F
 
 	fullpath := util.FullPath(fullFilePath)
 
+	// 【从 Filer 获取 Entry】
 	var fi FileInfo
 	entry, err := filer_pb.GetEntry(context.Background(), fs, fullpath)
 	if err != nil {
@@ -731,6 +809,8 @@ func (fs *WebDavFileSystem) stat(ctx context.Context, fullFilePath string) (os.F
 	if entry == nil {
 		return nil, os.ErrNotExist
 	}
+
+	// 【构造 FileInfo】
 	fi.size = int64(filer.FileSize(entry))
 	fi.name = string(fullpath)
 	fi.mode = os.FileMode(entry.Attributes.FileMode)
@@ -738,19 +818,49 @@ func (fs *WebDavFileSystem) stat(ctx context.Context, fullFilePath string) (os.F
 	fi.etag = filer.ETag(entry)
 	fi.isDirectory = entry.IsDirectory
 
+	// 【特殊处理根目录】
 	if fi.name == "/" {
 		fi.modifiedTime = time.Now()
 		fi.isDirectory = true
 	}
+
 	return &fi, nil
 }
 
+// Stat 获取文件信息
+// 实现 webdav.FileSystem 接口
+//
+// 参数:
+//   - ctx: 上下文
+//   - name: 文件路径
+//
+// 返回:
+//   - os.FileInfo: 文件信息对象
+//   - error: 获取错误
 func (fs *WebDavFileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	glog.V(2).Infof("WebDavFileSystem.Stat %v", name)
 
 	return fs.stat(ctx, name)
 }
 
+// saveDataAsChunk 将数据保存为一个 chunk
+// 用于文件上传时的分块存储
+//
+// 参数:
+//   - reader: 数据读取器
+//   - name: 文件名
+//   - offset: 文件内偏移量
+//   - tsNs: 时间戳（纳秒）
+//
+// 返回:
+//   - chunk: 上传成功的 FileChunk 信息
+//   - err: 上传错误
+//
+// 工作流程:
+//   1. 创建 Uploader
+//   2. 向 Master 请求分配 Volume
+//   3. 上传数据到 Volume Server
+//   4. 返回 FileChunk 元数据
 func (f *WebDavFile) saveDataAsChunk(reader io.Reader, name string, offset int64, tsNs int64) (chunk *filer_pb.FileChunk, err error) {
 	uploader, uploaderErr := operation.NewUploader()
 	if uploaderErr != nil {
@@ -788,9 +898,32 @@ func (f *WebDavFile) saveDataAsChunk(reader io.Reader, name string, offset int64
 		glog.V(0).Infof("upload failure %v: %v", f.name, flushErr)
 		return nil, fmt.Errorf("upload result: %v", uploadResult.Error)
 	}
+	// 【返回 FileChunk】
 	return uploadResult.ToPbFileChunk(fileId, offset, tsNs), nil
 }
 
+// Write 写入数据到文件
+// 实现 io.Writer 接口
+//
+// 参数:
+//   - buf: 要写入的数据
+//
+// 返回:
+//   - int: 实际写入的字节数
+//   - error: 写入错误
+//
+// 工作流程:
+//   1. 获取文件的 Entry（如果还没有）
+//   2. 配置 FlushFunc（数据上传到 Volume Server）
+//   3. 配置 CloseFunc（更新 Filer 元数据）
+//   4. 写入数据到缓冲区
+//   5. 达到阈值时自动上传
+//
+// 缓冲机制:
+//   - 使用 BufferedWriteCloser 缓冲写入
+//   - 达到 MaxMB 阈值时触发 FlushFunc
+//   - FlushFunc 将数据上传为一个 chunk
+//   - CloseFunc 在关闭时更新 Entry
 func (f *WebDavFile) Write(buf []byte) (int, error) {
 
 	glog.V(2).Infof("WebDavFileSystem.Write %v", f.name)
@@ -798,6 +931,7 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 	fullPath := util.FullPath(f.name)
 	dir, _ := fullPath.DirAndName()
 
+	// 【获取文件 Entry】
 	var getErr error
 	ctx := context.Background()
 	if f.entry == nil {
@@ -811,13 +945,19 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 		return 0, getErr
 	}
 
+	// 【配置 FlushFunc】
+	// 当缓冲区满时，自动上传数据
 	if f.bufWriter.FlushFunc == nil {
+		// FlushFunc：将缓冲数据上传到 Volume Server
 		f.bufWriter.FlushFunc = func(data []byte, offset int64) (flushErr error) {
 
+			// 【上传数据为 chunk】
 			var chunk *filer_pb.FileChunk
 			chunk, flushErr = f.saveDataAsChunk(util.NewBytesReader(data), f.name, offset, time.Now().UnixNano())
 
 			if flushErr != nil {
+				// 【上传失败处理】
+				// 如果是新文件（Mtime=0），删除失败的文件
 				if f.entry.Attributes.Mtime == 0 {
 					if err := f.fs.removeAll(ctx, f.name); err != nil {
 						glog.Errorf("bufWriter.Flush remove file error: %+v", f.name)
@@ -826,21 +966,27 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 				return fmt.Errorf("%s upload result: %v", f.name, flushErr)
 			}
 
+			// 【添加 chunk 到 Entry】
 			f.entry.Content = nil
 			f.entry.Chunks = append(f.entry.GetChunks(), chunk)
 
 			return flushErr
 		}
+
+		// CloseFunc：关闭时更新 Filer 元数据
 		f.bufWriter.CloseFunc = func() error {
 
+			// 【处理 chunk manifest】
+			// 如果 chunk 数量过多，创建 manifest chunk
 			manifestedChunks, manifestErr := filer.MaybeManifestize(f.saveDataAsChunk, f.entry.GetChunks())
 			if manifestErr != nil {
-				// not good, but should be ok
+				// 不是致命错误，可以继续
 				glog.V(0).Infof("file %s close MaybeManifestize: %v", f.name, manifestErr)
 			} else {
 				f.entry.Chunks = manifestedChunks
 			}
 
+			// 【更新 Filer Entry】
 			flushErr := f.fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 				f.entry.Attributes.Mtime = time.Now().Unix()
 
@@ -860,8 +1006,10 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 		}
 	}
 
+	// 【写入缓冲区】
 	written, err := f.bufWriter.Write(buf)
 
+	// 【更新文件大小和偏移量】
 	if err == nil {
 		f.entry.Attributes.FileSize = uint64(max(f.off+int64(written), int64(f.entry.Attributes.FileSize)))
 		glog.V(3).Infof("WebDavFileSystem.Write %v: written [%d,%d)", f.name, f.off, f.off+int64(len(buf)))
@@ -871,14 +1019,27 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 	return written, err
 }
 
+// Close 关闭文件
+// 实现 webdav.File 接口
+//
+// 返回:
+//   - error: 关闭错误
+//
+// 功能:
+//   - 刷新缓冲区（触发 FlushFunc）
+//   - 更新 Filer 元数据（触发 CloseFunc）
+//   - 清理内部状态
 func (f *WebDavFile) Close() error {
 
 	glog.V(2).Infof("WebDavFileSystem.Close %v", f.name)
+
+	// 【关闭缓冲写入器】
 	if f.bufWriter == nil {
 		return nil
 	}
 	err := f.bufWriter.Close()
 
+	// 【清理内部状态】
 	if f.entry != nil {
 		f.entry = nil
 		f.visibleIntervals = nil
@@ -887,10 +1048,31 @@ func (f *WebDavFile) Close() error {
 	return err
 }
 
+// Read 从文件读取数据
+// 实现 io.Reader 接口
+//
+// 参数:
+//   - p: 读取数据的缓冲区
+//
+// 返回:
+//   - readSize: 实际读取的字节数
+//   - err: 读取错误
+//
+// 工作流程:
+//   1. 获取文件 Entry（如果还没有）
+//   2. 计算可见区间（处理覆盖的 chunk）
+//   3. 创建 ChunkReader（从 Volume Server 读取）
+//   4. 从当前偏移量读取数据
+//   5. 更新偏移量
+//
+// 缓存机制:
+//   - 使用 readerCache 缓存 ChunkReader
+//   - 减少重复读取的开销
 func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 
 	glog.V(2).Infof("WebDavFileSystem.Read %v", f.name)
 
+	// 【获取文件 Entry】
 	if f.entry == nil {
 		f.entry, err = filer_pb.GetEntry(context.Background(), f.fs, util.FullPath(f.name))
 	}
@@ -900,22 +1082,32 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// 【检查文件大小】
 	fileSize := int64(filer.FileSize(f.entry))
 	if fileSize == 0 {
 		return 0, io.EOF
 	}
+
+	// 【计算可见区间】
+	// 处理覆盖的 chunk，确定实际可见的数据
 	if f.visibleIntervals == nil {
 		f.visibleIntervals, _ = filer.NonOverlappingVisibleIntervals(f.ctx, filer.LookupFn(f.fs), f.entry.GetChunks(), 0, fileSize)
 		f.reader = nil
 	}
+
+	// 【创建 ChunkReader】
 	if f.reader == nil {
 		chunkViews := filer.ViewFromVisibleIntervals(f.visibleIntervals, 0, fileSize)
 		f.reader = filer.NewChunkReaderAtFromClient(f.ctx, f.fs.readerCache, chunkViews, fileSize)
 	}
 
+	// 【从当前偏移量读取数据】
 	readSize, err = f.reader.ReadAt(p, f.off)
 
 	glog.V(3).Infof("WebDavFileSystem.Read %v: [%d,%d)", f.name, f.off, f.off+int64(readSize))
+
+	// 【更新偏移量】
 	f.off += int64(readSize)
 
 	if err != nil && err != io.EOF {
@@ -926,13 +1118,30 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 
 }
 
+// Readdir 读取目录内容
+// 实现 webdav.File 接口
+//
+// 参数:
+//   - count: 读取的条目数（-1 表示全部，0 表示全部）
+//
+// 返回:
+//   - ret: 文件信息列表
+//   - err: 读取错误
+//
+// 功能:
+//   - 从 Filer 读取目录所有条目
+//   - 支持分页（通过 count 和内部偏移量）
+//   - 自动为目录名添加 / 后缀
 func (f *WebDavFile) Readdir(count int) (ret []os.FileInfo, err error) {
 
 	glog.V(2).Infof("WebDavFileSystem.Readdir %v count %d", f.name, count)
 
+	// 【获取目录路径】
 	dir, _ := util.FullPath(f.name).DirAndName()
 
+	// 【读取目录所有条目】
 	err = filer_pb.ReadDirAllEntries(context.Background(), f.fs, util.FullPath(dir), "", func(entry *filer_pb.Entry, isLast bool) error {
+		// 构造 FileInfo
 		fi := FileInfo{
 			size:         int64(filer.FileSize(entry)),
 			name:         entry.Name,
@@ -941,6 +1150,7 @@ func (f *WebDavFile) Readdir(count int) (ret []os.FileInfo, err error) {
 			isDirectory:  entry.IsDirectory,
 		}
 
+		// 为目录名添加 / 后缀
 		if !strings.HasSuffix(fi.name, "/") && fi.IsDir() {
 			fi.name += "/"
 		}
@@ -952,19 +1162,23 @@ func (f *WebDavFile) Readdir(count int) (ret []os.FileInfo, err error) {
 		return nil, err
 	}
 
+	// 【处理分页】
 	old := f.off
 	if old >= int64(len(ret)) {
+		// 已经读到末尾
 		if count > 0 {
 			return nil, io.EOF
 		}
 		return nil, nil
 	}
 	if count > 0 {
+		// 读取指定数量
 		f.off += int64(count)
 		if f.off > int64(len(ret)) {
 			f.off = int64(len(ret))
 		}
 	} else {
+		// 读取全部
 		f.off = int64(len(ret))
 		old = 0
 	}
@@ -972,6 +1186,21 @@ func (f *WebDavFile) Readdir(count int) (ret []os.FileInfo, err error) {
 	return ret[old:f.off], nil
 }
 
+// Seek 移动文件读取位置
+// 实现 io.Seeker 接口
+//
+// 参数:
+//   - offset: 偏移量
+//   - whence: 起始位置（io.SeekStart、io.SeekCurrent、io.SeekEnd）
+//
+// 返回:
+//   - int64: 新的偏移量
+//   - error: Seek 错误
+//
+// 起始位置:
+//   - io.SeekStart: 从文件开头
+//   - io.SeekCurrent: 从当前位置
+//   - io.SeekEnd: 从文件末尾
 func (f *WebDavFile) Seek(offset int64, whence int) (int64, error) {
 
 	glog.V(2).Infof("WebDavFile.Seek %v %v %v", f.name, offset, whence)
@@ -981,8 +1210,10 @@ func (f *WebDavFile) Seek(offset int64, whence int) (int64, error) {
 	var err error
 	switch whence {
 	case io.SeekStart:
+		// 从文件开头
 		f.off = 0
 	case io.SeekEnd:
+		// 从文件末尾
 		if fi, err := f.fs.stat(ctx, f.name); err != nil {
 			return 0, err
 		} else {

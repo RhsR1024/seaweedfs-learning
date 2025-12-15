@@ -51,7 +51,10 @@ func setExitStatus(n int) {
 	exitMu.Unlock()
 }
 
-// go:embed static
+// NOTE: 下面的 //go:embed 指令必须紧贴 //，中间不能有空格！
+// 错误写法 "// go:embed" 会导致静态资源无法嵌入，Web UI 将无法加载 CSS/JS/图片（404 错误）
+//
+//go:embed static
 // static 嵌入 static 目录下的所有静态资源文件
 // 这些文件会被编译到二进制文件中，无需外部文件依赖
 var static embed.FS
